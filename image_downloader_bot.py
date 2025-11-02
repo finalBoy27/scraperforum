@@ -59,23 +59,17 @@ ALLOWED_CHAT_IDS = {5809601894, 1285451259}  # Users who can use the bot
 # ───────────────────────────────
 # 🌐 HTTP & DOWNLOAD SETTINGS
 # ───────────────────────────────
-MAX_CONCURRENT_WORKERS = 30          # Maximum concurrent downloads at once
-DELAY_BETWEEN_REQUESTS = 0.03        # Delay between each download request (seconds)
-TIMEOUT = [10.0, 14.0, 18.0, 20.0]   # HTTP request timeout per attempt (seconds) - grows dynamically
+MAX_CONCURRENT_WORKERS = 15          # Maximum concurrent downloads at once
+DELAY_BETWEEN_REQUESTS_MIN = 0.03    # Minimum random delay between requests (seconds)
+DELAY_BETWEEN_REQUESTS_MAX = 0.15     # Maximum random delay between requests (seconds)
+TIMEOUT = [12.0, 15.0, 18.0, 21.0]   # HTTP request timeout per attempt (seconds) - grows dynamically for slow servers
 MAX_DOWNLOAD_RETRIES = 4             # How many times to retry a failed download
-RETRY_DELAY = [0.5, 0.6, 0.7, 0.8]   # Wait time between retries per attempt (seconds) - grows dynamically
+RETRY_DELAY = [0.5, 0.7, 0.9, 0.11]   # Wait time between retries per attempt (seconds) - exponential backoff
 CONNECTION_POOL_SIZE = 80            # HTTP connection pool size for reuse
 MAX_CONNECTIONS = 300                # Maximum total HTTP connections
 
 # ───────────────────────────────
-# 📦 BATCH PROCESSING SETTINGS
-# ───────────────────────────────
-BATCH_SIZE = 40                      # URLs processed per download batch
-CHUNK_SIZE = 60                      # URLs per processing chunk
-BATCH_URLS_COUNT = 10                # Number of URLs to process together
-
-# ───────────────────────────────
-# 📤 TELEGRAM SENDING SETTINGS
+#  TELEGRAM SENDING SETTINGS
 # ───────────────────────────────
 MAX_CONCURRENT_SENDS = 6             # Maximum concurrent sends to Telegram
 SEND_DELAY = 0.15                    # Delay between sends (seconds)
@@ -192,7 +186,7 @@ if SUPPRESS_HTTPX_LOGS:
     logging.getLogger('httpx').setLevel(logging.WARNING)
 
 def log_memory():
-    """Log detailed memory usage with garbage collection info"""
+    """Log detailed memory usage with garbage collection info - AGGRESSIVE CLEANUP"""
     if not LOG_MEMORY_USAGE:
         return
         
@@ -203,56 +197,46 @@ def log_memory():
         
         # Get detailed memory statistics
         rss_mb = memory_info.rss / 1024 / 1024  # Resident Set Size
-        vms_mb = memory_info.vms / 1024 / 1024  # Virtual Memory Size
+        
+        # CRITICAL: Force aggressive cleanup if memory > 400MB
+        if rss_mb > 400:
+            logger.warning(f"⚠️ HIGH MEMORY: {rss_mb:.2f}MB - Forcing aggressive cleanup")
+            # Force immediate garbage collection
+            collected = gc.collect(2)  # Collect generation 2 (oldest)
+            collected += gc.collect(1)  # Collect generation 1
+            collected += gc.collect(0)  # Collect generation 0
+            logger.info(f"🧹 Emergency GC collected {collected} objects")
         
         # Get garbage collection statistics
-        gc_stats = gc.get_stats()
         gc_counts = gc.get_count()
         
-        logger.info(f"💾 Memory: RSS={rss_mb:.2f}MB, VMS={vms_mb:.2f}MB | GC: {gc_counts} | Objects: {len(gc.get_objects())}")
-        
-        # Log detailed GC stats for each generation (only if enabled)
-        if LOG_DETAILED_GC_STATS:
-            for i, stats in enumerate(gc_stats):
-                if stats['collections'] > 0:
-                    logger.debug(f"GC Gen{i}: {stats['collections']} collections, {stats['collected']} collected, {stats['uncollectable']} uncollectable")
+        logger.info(f"💾 Memory: {rss_mb:.2f}MB | GC: {gc_counts}")
                 
     except ImportError:
         # Fallback to basic GC info without psutil
         gc_counts = gc.get_count()
-        logger.info(f"💾 Memory tracking limited (no psutil) | GC: {gc_counts} | Objects: {len(gc.get_objects())}")
+        logger.info(f"💾 Memory tracking limited | GC: {gc_counts}")
 
 def force_garbage_collection():
-    """Force aggressive garbage collection and log results"""
+    """Force AGGRESSIVE garbage collection to prevent memory overflow"""
     if not ENABLE_GARBAGE_COLLECTION:
         return 0, 0
         
     try:
-        # Get initial object count
-        initial_objects = len(gc.get_objects())
-        initial_counts = gc.get_count()
-        
-        # Force collection for all generations
-        collected = 0
-        for generation in range(3):
-            collected += gc.collect(generation)
-        
-        # Get final counts
-        final_objects = len(gc.get_objects())
-        final_counts = gc.get_count()
-        objects_freed = initial_objects - final_objects
+        # Force collection for all generations - REVERSE ORDER (oldest first)
+        collected = gc.collect(2)  # Generation 2 (oldest objects)
+        collected += gc.collect(1)  # Generation 1
+        collected += gc.collect(0)  # Generation 0 (newest objects)
         
         if LOG_MEMORY_USAGE:
-            logger.info(f"🧹 GC: Collected {collected} objects, freed {objects_freed} references | {initial_counts} → {final_counts}")
+            logger.info(f"🧹 GC: Freed {collected} objects")
         
-        return collected, objects_freed
+        return collected, 0
         
     except Exception as e:
         logger.warning(f"⚠️ Garbage collection error: {str(e)}")
         # Fallback to basic collection
         collected = gc.collect()
-        if LOG_MEMORY_USAGE:
-            logger.info(f"🧹 GC: Basic collection freed {collected} objects")
         return collected, 0
 
 def generate_bar(percentage):
@@ -405,6 +389,7 @@ def convert_image_for_telegram(filepath):
     """Convert/optimize image for better Telegram compatibility with multiple strategies
     Returns: new filepath if conversion successful, None otherwise"""
     try:
+        # Open image briefly to get metadata and make a copy
         with Image.open(filepath) as img:
             # Handle GIF format - convert to thumbnail
             if img.format == 'GIF':
@@ -438,32 +423,46 @@ def convert_image_for_telegram(filepath):
             # Always convert to ensure Telegram compatibility
             needs_conversion = True
             
-            # Convert with multiple strategies
-            if needs_conversion:
-                # Determine output filepath with .jpg extension
-                if not filepath.lower().endswith('.jpg') and not filepath.lower().endswith('.jpeg'):
-                    new_filepath = filepath.rsplit('.', 1)[0] + '.jpg'
-                else:
-                    new_filepath = filepath
-                
-                # Strategy 1: Try to preserve as much quality as possible
-                success = _try_conversion_strategy(img, filepath, new_filepath, target_width, target_height, file_size, strategy=1)
-                if success:
-                    return new_filepath
-                
-                # Strategy 2: More aggressive compression
-                logger.warning("🔄 First conversion failed, trying more aggressive compression")
-                success = _try_conversion_strategy(img, filepath, new_filepath, target_width, target_height, file_size, strategy=2)
-                if success:
-                    return new_filepath
-                
-                # Strategy 3: Very aggressive - minimal quality but guaranteed compatibility
-                logger.warning("🔄 Second conversion failed, trying maximum compression")
-                success = _try_conversion_strategy(img, filepath, new_filepath, target_width, target_height, file_size, strategy=3)
-                if success:
-                    return new_filepath
+            # CRITICAL: Make ONE copy and close original IMMEDIATELY
+            working_img = img.copy()
+        
+        # Original img is now closed and memory freed
+        
+        # Convert with multiple strategies using the copy
+        if needs_conversion:
+            # Determine output filepath with .jpg extension
+            if not filepath.lower().endswith('.jpg') and not filepath.lower().endswith('.jpeg'):
+                new_filepath = filepath.rsplit('.', 1)[0] + '.jpg'
+            else:
+                new_filepath = filepath
             
-            return None  # No conversion needed or all strategies failed
+            # Strategy 1: Try to preserve as much quality as possible
+            success = _try_conversion_strategy(working_img, filepath, new_filepath, target_width, target_height, file_size, strategy=1)
+            if success:
+                del working_img
+                gc.collect()
+                return new_filepath
+            
+            # Strategy 2: More aggressive compression
+            logger.warning("🔄 First conversion failed, trying more aggressive compression")
+            success = _try_conversion_strategy(working_img, filepath, new_filepath, target_width, target_height, file_size, strategy=2)
+            if success:
+                del working_img
+                gc.collect()
+                return new_filepath
+            
+            # Strategy 3: Very aggressive - minimal quality but guaranteed compatibility
+            logger.warning("🔄 Second conversion failed, trying maximum compression")
+            success = _try_conversion_strategy(working_img, filepath, new_filepath, target_width, target_height, file_size, strategy=3)
+            if success:
+                del working_img
+                gc.collect()
+                return new_filepath
+        
+        # Cleanup if all failed
+        del working_img
+        gc.collect()
+        return None  # No conversion needed or all strategies failed
             
     except Exception as e:
         logger.error(f"❌ Image conversion failed for {filepath}: {str(e)}")
@@ -472,10 +471,11 @@ def convert_image_for_telegram(filepath):
 def _try_conversion_strategy(img, old_filepath, new_filepath, target_width, target_height, original_size, strategy=1):
     """Try different conversion strategies with increasing aggressiveness
     old_filepath: original file path
-    new_filepath: output file path (with .jpg extension)"""
+    new_filepath: output file path (with .jpg extension)
+    img: ALREADY A COPY - do NOT copy again"""
     try:
-        # Create a copy to work with
-        working_img = img.copy()
+        # Use the image directly (it's already a copy from convert_image_for_telegram)
+        working_img = img
         
         # Resize if needed
         if target_width != img.width or target_height != img.height:
@@ -519,15 +519,20 @@ def _try_conversion_strategy(img, old_filepath, new_filepath, target_width, targ
         # Save with specified quality to new filepath
         working_img.save(new_filepath, 'JPEG', quality=quality, optimize=optimize, progressive=True)
         
-        # Remove old file if different from new file
+        # CRITICAL: Clear working image from memory IMMEDIATELY
+        del working_img
+        gc.collect()
+        
+        # Remove old file IMMEDIATELY if different from new file
         if old_filepath != new_filepath and os.path.exists(old_filepath):
             try:
                 os.remove(old_filepath)
+                logger.debug(f"🗑️ Deleted original: {old_filepath}")
             except:
                 pass
         
         new_size = os.path.getsize(new_filepath)
-        logger.info(f"✅ Strategy {strategy} successful: {original_size} → {new_size} bytes (Q{quality}) → {new_filepath}")
+        logger.info(f"✅ Strategy {strategy} successful: {original_size} → {new_size} bytes (Q{quality})")
         
         # Validate the result
         if new_size > MAX_IMAGE_SIZE:
@@ -922,7 +927,9 @@ async def download_batch(urls, temp_dir, base_timeout=None):
 async def download_image_with_client(url, temp_dir, semaphore, client, max_retries=MAX_DOWNLOAD_RETRIES):
     """Download single image using provided client - memory efficient with detailed logging"""
     async with semaphore:
-        await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
+        # Random delay between requests (0.01 to 1.0 seconds) to avoid rate limiting
+        random_delay = random.uniform(DELAY_BETWEEN_REQUESTS_MIN, DELAY_BETWEEN_REQUESTS_MAX)
+        await asyncio.sleep(random_delay)
         
         for attempt in range(1, max_retries + 1):
             try:
@@ -1078,17 +1085,28 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
                         
             except asyncio.TimeoutError:
                 if attempt == max_retries:
-                    logger.error(f"❌ Timeout after {max_retries} attempts ({current_timeout}s timeout): {url}")
+                    logger.error(f"❌ Timeout after {max_retries} attempts (max {TIMEOUT[-1]}s timeout): {url}")
                     await update_url_download_status(url, 'failed', error_reason="timeout")
                     return None
                 else:
-                    logger.warning(f"⚠️ Timeout on attempt {attempt} ({current_timeout}s), retrying with longer timeout: {url}")
+                    next_timeout = TIMEOUT[min(attempt, len(TIMEOUT) - 1)]
+                    logger.warning(f"⚠️ Timeout on attempt {attempt} ({current_timeout}s), will retry with {next_timeout}s timeout: {url}")
             except Exception as e:
                 error_msg = str(e).lower()
                 error_type = type(e).__name__
                 
-                # Log full error details
-                logger.warning(f"⚠️ Exception on attempt {attempt}: {error_type} - {str(e)[:300]}")
+                # Enhanced logging for ReadTimeout specifically
+                if "readtimeout" in error_type.lower() or "read timeout" in error_msg:
+                    if attempt == max_retries:
+                        logger.error(f"❌ ReadTimeout after {max_retries} attempts (max {TIMEOUT[-1]}s): {url}")
+                        await update_url_download_status(url, 'failed', error_reason="read_timeout")
+                        return None
+                    else:
+                        next_timeout = TIMEOUT[min(attempt, len(TIMEOUT) - 1)]
+                        logger.warning(f"⚠️ ReadTimeout on attempt {attempt} ({current_timeout}s), will retry with {next_timeout}s: {url}")
+                else:
+                    # Log full error details for other errors
+                    logger.warning(f"⚠️ Exception on attempt {attempt}: {error_type} - {str(e)[:300]}")
                 
                 if "connection" in error_msg or "network" in error_msg or "read" in error_msg or "timeout" in error_msg:
                     if attempt == max_retries:
@@ -1106,10 +1124,11 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
                         logger.warning(f"⚠️ Download attempt {attempt} failed: {url} - {error_type}: {str(e)[:100]}")
             
             if attempt < max_retries:
-                # Use dynamic retry delay growth for each attempt
+                # Use dynamic retry delay growth for each attempt (exponential backoff)
                 retry_index = min(attempt - 1, len(RETRY_DELAY) - 1)
                 current_retry_delay = RETRY_DELAY[retry_index]
-                logger.info(f"🔄 Retrying in {current_retry_delay}s: {url}")
+                next_timeout = TIMEOUT[min(attempt, len(TIMEOUT) - 1)]
+                logger.info(f"🔄 Retry {attempt}/{max_retries}: Waiting {current_retry_delay}s, next timeout: {next_timeout}s | {url}")
                 await asyncio.sleep(current_retry_delay)
         
         return None
@@ -1284,45 +1303,54 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
     # Return True if at least some chunks were successful
     success_rate = successful_chunks / total_chunks if total_chunks > 0 else 0
     
-    # Log memory usage before cleanup
-    logger.info(f"📊 {username}: {successful_chunks}/{total_chunks} chunks sent successfully ({success_rate:.1%})")
-    log_memory()
+    # CRITICAL: Clear ALL image data from memory IMMEDIATELY after send
+    if images:
+        for img in images:
+            try:
+                # Clear path reference
+                if isinstance(img, dict):
+                    img.clear()
+            except:
+                pass
+        images.clear()
     
-    # Force garbage collection after sending to free up memory
-    collected, objects_freed = force_garbage_collection()
+    # Force IMMEDIATE garbage collection
+    collected, _ = force_garbage_collection()
     
-    # Log memory usage after cleanup
+    # Log memory after cleanup
     log_memory()
-    logger.info(f"🧹 Post-send cleanup: {collected} objects collected, {objects_freed} references freed")
+    logger.info(f"📊 {username}: {successful_chunks}/{total_chunks} sent | 🧹 Freed {collected} objects")
     
     return success_rate > 0
 
 def cleanup_images(images):
-    """Remove temp image files with error handling and memory cleanup"""
+    """AGGRESSIVE cleanup - Remove files AND clear memory immediately"""
     if not images:
         return
     
     cleaned_files = 0
     for img in images:
         try:
+            # Delete file from disk
             if isinstance(img, dict) and 'path' in img and os.path.exists(img['path']):
                 os.remove(img['path'])
                 cleaned_files += 1
+                # Clear dict immediately
+                img.clear()
             elif isinstance(img, str) and os.path.exists(img):
                 os.remove(img)
                 cleaned_files += 1
         except Exception as e:
-            logger.debug(f"Cleanup error for {img}: {str(e)}")
+            logger.debug(f"Cleanup error: {str(e)}")
     
     # Clear the list to free memory references
     if isinstance(images, list):
         images.clear()
     
-    # Force garbage collection after cleanup
+    # IMMEDIATE garbage collection
     if cleaned_files > 0:
-        logger.debug(f"🧹 Cleaned {cleaned_files} image files, forcing GC")
-        collected = gc.collect()
-        logger.debug(f"🧹 GC collected {collected} objects after file cleanup")
+        gc.collect()
+        logger.debug(f"🧹 Cleaned {cleaned_files} files")
 
 async def process_batches(username_images, chat_id, topic_id=None, user_topic_ids=None, progress_msg=None):
     """
@@ -1430,24 +1458,25 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                         success_images = success_images[10:]
                         
                         logger.info(f"\n📤 IMMEDIATE SEND: {len(send_batch)} images for {username} (Pending: {len(success_images)})")
-                        logger.info(f"📊 Send details: chat_id={chat_id}, topic={user_topic}")
                         
                         try:
                             success = await send_image_batch_pyrogram(send_batch, username, chat_id, user_topic, batch_num)
                             if success:
                                 total_sent += 10
-                                logger.info(f"✅ Sent 10 images | Total sent: {total_sent}")
+                                logger.info(f"✅ Sent 10 images | Total: {total_sent}")
                             else:
-                                logger.warning(f"⚠️ Send failed - returned False")
+                                logger.warning(f"⚠️ Send failed")
                         except Exception as e:
                             logger.error(f"❌ Send error: {str(e)}")
-                            import traceback
-                            logger.error(f"📜 Traceback: {traceback.format_exc()}")
                         
-                        # Clean up sent images immediately
+                        # CRITICAL: Immediate cleanup after send
                         cleanup_images(send_batch)
-                        collected, objects_freed = force_garbage_collection()
-                        logger.info(f"🧹 Cleanup: {collected} collected, {objects_freed} freed | Pending: {len(success_images)}")
+                        send_batch.clear()
+                        del send_batch
+                        
+                        # Force immediate GC
+                        collected, _ = force_garbage_collection()
+                        log_memory()
                         
                         await asyncio.sleep(SEND_DELAY)
                 
@@ -1508,9 +1537,8 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                 
                 batch_num += 1
                 
-                # Batch cleanup
-                logger.info(f"🧹 Batch {batch_num-1} complete, cleaning memory...")
-                collected, objects_freed = force_garbage_collection()
+                # AGGRESSIVE batch cleanup
+                collected, _ = force_garbage_collection()
                 log_memory()
             
             round_num += 1
@@ -1523,39 +1551,38 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                 success = await send_image_batch_pyrogram(success_images, username, chat_id, user_topic, batch_num)
                 if success:
                     total_sent += len(success_images)
-                    logger.info(f"✅ Sent final batch | Total sent: {total_sent}")
+                    logger.info(f"✅ Sent final batch | Total: {total_sent}")
             except Exception as e:
                 logger.error(f"❌ Error sending final batch: {str(e)}")
             
-            # Cleanup
+            # CRITICAL: Final cleanup
             cleanup_images(success_images)
             success_images.clear()
-            collected, objects_freed = force_garbage_collection()
-            logger.info(f"🧹 Final user cleanup: {collected} objects collected, {objects_freed} freed")
+            del success_images
+            
+            force_garbage_collection()
             log_memory()
         
         logger.info(f"\n✅ Completed user: {username}")
-        logger.info(f"   • Successfully downloaded: {len(successfully_downloaded_urls)}/{total_urls_user}")
-        logger.info(f"   • Successfully sent: {total_sent}")
-        logger.info(f"   • Permanently failed: {total_failed_permanently}")
+        logger.info(f"   • Downloaded: {len(successfully_downloaded_urls)}/{total_urls_user}")
+        logger.info(f"   • Sent: {total_sent}")
         logger.info(f"{'='*60}\n")
     
     # Final cleanup
     try:
         await aioshutil.rmtree(temp_dir)
-        logger.info(f"🗂️ Removed temporary directory: {temp_dir}")
+        logger.info(f"🗂️ Removed temp directory")
     except:
         pass
     
-    # Final memory cleanup
-    collected, objects_freed = force_garbage_collection()
+    # FINAL memory cleanup
+    force_garbage_collection()
     log_memory()
-    logger.info(f"🏁 Final cleanup: {collected} objects collected, {objects_freed} references freed")
     
     logger.info(f"\n{'='*60}")
     logger.info(f"📊 FINAL STATISTICS:")
-    logger.info(f"✅ Total Downloaded: {total_downloaded}")
-    logger.info(f"📤 Total Sent: {total_sent}")
+    logger.info(f"✅ Downloaded: {total_downloaded}")
+    logger.info(f"📤 Sent: {total_sent}")
     logger.info(f"❌ Total Failed Permanently: {total_failed_permanently}")
     logger.info(f"{'='*60}\n")
     
