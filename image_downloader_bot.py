@@ -88,7 +88,9 @@ PROGRESS_UPDATE_DELAY = 5            # Minimum seconds between any progress upda
 
 # === STORAGE SETTINGS ===
 TEMP_DIR = "temp_images"             # Temporary directory for downloaded images
-TEMP_DB = "Scraping/tempImages.db"   # Database for tracking (not used currently)
+DB_DIR = "Scraping"                  # Database directory
+DB_PATH = "Scraping/media_tracking.db"  # SQLite database for tracking downloads
+ENABLE_DATABASE = True               # Enable database for tracking and deduplication
 
 # Initialize Pyrogram client
 bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -114,6 +116,211 @@ def generate_bar(percentage):
     filled = int(percentage / 10)
     empty = 10 - filled
     return "●" * filled + "○" * (empty // 2) + "◌" * (empty - empty // 2)
+
+# ───────────────────────────────
+# 🗄️ DATABASE MANAGEMENT
+# ───────────────────────────────
+
+async def init_database():
+    """Initialize SQLite database with required tables"""
+    try:
+        os.makedirs(DB_DIR, exist_ok=True)
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Table for tracking downloaded URLs
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS downloaded_urls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT UNIQUE NOT NULL,
+                    username TEXT,
+                    file_path TEXT,
+                    file_size INTEGER,
+                    media_type TEXT,
+                    download_timestamp INTEGER,
+                    status TEXT DEFAULT 'pending',
+                    retry_count INTEGER DEFAULT 0,
+                    error_message TEXT
+                )
+            ''')
+            
+            # Index for faster lookups
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_url ON downloaded_urls(url)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_status ON downloaded_urls(status)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_username ON downloaded_urls(username)')
+            
+            # Table for batch tracking
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS batch_tracking (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    batch_number INTEGER,
+                    total_urls INTEGER,
+                    downloaded INTEGER,
+                    sent INTEGER,
+                    failed INTEGER,
+                    timestamp INTEGER
+                )
+            ''')
+            
+            # Table for sent images tracking (prevent duplicate sends)
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS sent_images (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT UNIQUE NOT NULL,
+                    chat_id INTEGER,
+                    topic_id INTEGER,
+                    username TEXT,
+                    batch_number INTEGER,
+                    sent_timestamp INTEGER
+                )
+            ''')
+            
+            await db.commit()
+            logger.info("✅ Database initialized successfully")
+            
+            # Clean up old data (optional - keep last 7 days)
+            seven_days_ago = int(time.time()) - (7 * 24 * 60 * 60)
+            await db.execute('DELETE FROM downloaded_urls WHERE download_timestamp < ?', (seven_days_ago,))
+            await db.execute('DELETE FROM batch_tracking WHERE timestamp < ?', (seven_days_ago,))
+            await db.commit()
+            
+            # Force garbage collection after DB operations
+            gc.collect()
+            
+    except Exception as e:
+        logger.error(f"❌ Database initialization error: {str(e)}")
+
+async def check_url_downloaded(url):
+    """Check if URL was already successfully downloaded"""
+    if not ENABLE_DATABASE:
+        return False
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                'SELECT status FROM downloaded_urls WHERE url = ? AND status = "success"',
+                (url,)
+            ) as cursor:
+                result = await cursor.fetchone()
+                return result is not None
+    except Exception as e:
+        logger.warning(f"⚠️ Database check error for {url}: {str(e)}")
+        return False
+
+async def check_url_sent(url, chat_id):
+    """Check if URL was already sent to this chat"""
+    if not ENABLE_DATABASE:
+        return False
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                'SELECT id FROM sent_images WHERE url = ? AND chat_id = ?',
+                (url, chat_id)
+            ) as cursor:
+                result = await cursor.fetchone()
+                return result is not None
+    except Exception as e:
+        logger.warning(f"⚠️ Database sent check error: {str(e)}")
+        return False
+
+async def mark_url_downloaded(url, username, file_path, file_size, media_type, status='success', error_msg=None):
+    """Mark URL as downloaded in database"""
+    if not ENABLE_DATABASE:
+        return
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute('''
+                INSERT OR REPLACE INTO downloaded_urls 
+                (url, username, file_path, file_size, media_type, download_timestamp, status, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (url, username, file_path, file_size, media_type, int(time.time()), status, error_msg))
+            await db.commit()
+            
+        # Force garbage collection
+        gc.collect()
+    except Exception as e:
+        logger.warning(f"⚠️ Database insert error: {str(e)}")
+
+async def mark_url_sent(url, chat_id, topic_id, username, batch_number):
+    """Mark URL as sent in database"""
+    if not ENABLE_DATABASE:
+        return
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute('''
+                INSERT OR IGNORE INTO sent_images 
+                (url, chat_id, topic_id, username, batch_number, sent_timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (url, chat_id, topic_id, username, batch_number, int(time.time())))
+            await db.commit()
+            
+        # Force garbage collection
+        gc.collect()
+    except Exception as e:
+        logger.warning(f"⚠️ Database sent tracking error: {str(e)}")
+
+async def save_batch_stats(session_id, batch_number, total_urls, downloaded, sent, failed):
+    """Save batch statistics to database"""
+    if not ENABLE_DATABASE:
+        return
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute('''
+                INSERT INTO batch_tracking 
+                (session_id, batch_number, total_urls, downloaded, sent, failed, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (session_id, batch_number, total_urls, downloaded, sent, failed, int(time.time())))
+            await db.commit()
+            
+        # Force garbage collection
+        gc.collect()
+    except Exception as e:
+        logger.warning(f"⚠️ Batch stats save error: {str(e)}")
+
+async def get_failed_urls_from_db(session_id=None, limit=100):
+    """Get failed URLs from database for retry"""
+    if not ENABLE_DATABASE:
+        return []
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            query = '''
+                SELECT url, username, retry_count 
+                FROM downloaded_urls 
+                WHERE status = "failed" AND retry_count < ?
+                ORDER BY retry_count ASC, download_timestamp DESC
+                LIMIT ?
+            '''
+            async with db.execute(query, (MAX_DOWNLOAD_RETRIES, limit)) as cursor:
+                results = await cursor.fetchall()
+                
+        # Force garbage collection
+        gc.collect()
+        return results
+    except Exception as e:
+        logger.warning(f"⚠️ Failed URLs retrieval error: {str(e)}")
+        return []
+
+async def cleanup_database():
+    """Clean up database and optimize"""
+    if not ENABLE_DATABASE:
+        return
+    
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Vacuum to reclaim space
+            await db.execute('VACUUM')
+            await db.commit()
+            logger.info("✅ Database optimized")
+            
+        # Force garbage collection
+        gc.collect()
+    except Exception as e:
+        logger.warning(f"⚠️ Database cleanup error: {str(e)}")
 
 # ───────────────────────────────
 # 📹 VIDEO & GIF CONVERSION
@@ -374,6 +581,10 @@ def filter_and_deduplicate_urls(username_images):
     
     logger.info(f"📊 Media filtered - Images: {media_stats['images']}, GIFs: {media_stats['gifs']}, "
                 f"Videos: {media_stats['videos']}, Excluded: {media_stats['excluded']}")
+    
+    # Clear seen_urls set to free memory
+    seen_urls.clear()
+    gc.collect()
 
     return filtered_username_images, all_urls
 
@@ -381,6 +592,18 @@ async def download_image(url, temp_dir, semaphore, url_metadata=None):
     """Download single image/video/gif with retries and conversion"""
     async with semaphore:
         await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
+        
+        # Check if already downloaded in database
+        if ENABLE_DATABASE and await check_url_downloaded(url):
+            logger.info(f"ℹ️ URL already downloaded (from DB): {url}")
+            return None
+        
+        username = url_metadata.get('username') if url_metadata else 'Unknown'
+        media_type = 'image'
+        if is_video_url(url):
+            media_type = 'video'
+        elif is_gif_url(url):
+            media_type = 'gif'
         
         for attempt in range(MAX_DOWNLOAD_RETRIES):
             current_timeout = TIMEOUT[min(attempt, len(TIMEOUT) - 1)]
@@ -394,6 +617,9 @@ async def download_image(url, temp_dir, semaphore, url_metadata=None):
                         content = r.content
                         if len(content) < MIN_IMAGE_SIZE:
                             logger.warning(f"⚠️ Content too small ({len(content)} bytes): {url}")
+                            if ENABLE_DATABASE:
+                                await mark_url_downloaded(url, username, None, len(content), media_type, 
+                                                        status='failed', error_msg='Content too small')
                             return None
                         
                         # Determine file extension from URL or content-type
@@ -420,18 +646,28 @@ async def download_image(url, temp_dir, semaphore, url_metadata=None):
                         with open(filepath, 'wb') as f:
                             f.write(content)
                         
+                        # Clear content from memory immediately
+                        del content
+                        gc.collect()
+                        
                         # Convert if needed
                         if is_video_url(url) and ENABLE_VIDEO_CONVERSION:
                             converted_path = convert_video_to_thumbnail(filepath)
                             if converted_path:
                                 filepath = converted_path
                             else:
+                                if ENABLE_DATABASE:
+                                    await mark_url_downloaded(url, username, None, 0, media_type, 
+                                                            status='failed', error_msg='Video conversion failed')
                                 return None  # Conversion failed
                         elif is_gif_url(url) and ENABLE_GIF_CONVERSION:
                             converted_path = convert_gif_to_thumbnail(filepath)
                             if converted_path:
                                 filepath = converted_path
                             else:
+                                if ENABLE_DATABASE:
+                                    await mark_url_downloaded(url, username, None, 0, media_type, 
+                                                            status='failed', error_msg='GIF conversion failed')
                                 return None  # Conversion failed
                         else:
                             # Normalize extension for regular images
@@ -440,20 +676,32 @@ async def download_image(url, temp_dir, semaphore, url_metadata=None):
                         # Verify file exists and has content
                         if not os.path.exists(filepath):
                             logger.error(f"❌ File disappeared after processing: {filepath}")
+                            if ENABLE_DATABASE:
+                                await mark_url_downloaded(url, username, None, 0, media_type, 
+                                                        status='failed', error_msg='File disappeared after processing')
                             return None
                         
                         final_size = os.path.getsize(filepath)
                         logger.info(f"✅ Downloaded & processed ({final_size} bytes): {url}")
                         
-                        return {
+                        # Mark as successfully downloaded in database
+                        if ENABLE_DATABASE:
+                            await mark_url_downloaded(url, username, filepath, final_size, media_type, status='success')
+                        
+                        result = {
                             'url': url,
                             'path': filepath,
                             'size': final_size,
-                            'username': url_metadata.get('username') if url_metadata else None
+                            'username': username
                         }
+                        
+                        return result
                     
                     elif r.status_code == 404:
                         logger.info(f"ℹ️ 404 Not Found: {url}")
+                        if ENABLE_DATABASE:
+                            await mark_url_downloaded(url, username, None, 0, media_type, 
+                                                    status='failed', error_msg='404 Not Found')
                         return None  # Not retryable
                     else:
                         logger.warning(f"⚠️ HTTP {r.status_code} for {url} (attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES})")
@@ -468,6 +716,12 @@ async def download_image(url, temp_dir, semaphore, url_metadata=None):
                 await asyncio.sleep(current_retry_delay)
         
         logger.error(f"❌ Failed after {MAX_DOWNLOAD_RETRIES} attempts: {url}")
+        
+        # Mark as failed in database
+        if ENABLE_DATABASE:
+            await mark_url_downloaded(url, username, None, 0, media_type, 
+                                    status='failed', error_msg=f'Failed after {MAX_DOWNLOAD_RETRIES} attempts')
+        
         return None
 
 async def download_batch(urls, temp_dir, username_map=None):
@@ -502,6 +756,18 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
         logger.warning(f"⚠️ Attempted to send {len(images)} images, expected {BATCH_SEND_SIZE}")
         return False
     
+    # Check if already sent in database
+    if ENABLE_DATABASE:
+        already_sent = []
+        for img in images:
+            if await check_url_sent(img['url'], chat_id):
+                already_sent.append(img['url'])
+        
+        if already_sent:
+            logger.info(f"ℹ️ {len(already_sent)} images already sent to this chat, skipping")
+            if len(already_sent) == len(images):
+                return True  # All already sent, consider it success
+    
     async with SEND_SEMAPHORE:
         await asyncio.sleep(SEND_DELAY)  # Rate limit protection
         
@@ -522,6 +788,12 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
                     await bot.send_media_group(chat_id, media)
                 
                 logger.info(f"✅ Sent batch {batch_num} for {username} ({len(images)} images)")
+                
+                # Mark images as sent in database
+                if ENABLE_DATABASE:
+                    for img in images:
+                        await mark_url_sent(img['url'], chat_id, topic_id, username, batch_num)
+                
                 return True
                 
             except FloodWait as e:
@@ -545,17 +817,23 @@ def cleanup_images(images):
     if not images:
         return
     
+    files_deleted = 0
     for img in images:
         try:
             if isinstance(img, dict) and 'path' in img:
                 if os.path.exists(img['path']):
                     os.remove(img['path'])
+                    files_deleted += 1
         except Exception as e:
             logger.warning(f"⚠️ Cleanup error for {img.get('path', 'unknown')}: {str(e)}")
     
-    # Clear references
+    # Clear references and force garbage collection
     images.clear()
     gc.collect()
+    
+    # Log memory after cleanup
+    logger.info(f"🧹 Cleaned up {files_deleted} image files")
+    log_memory()
 
 async def process_batches(username_images, chat_id, topic_id=None, user_topic_ids=None, progress_msg=None):
     """
@@ -565,7 +843,15 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
     - Track pending sends accurately
     - Handle failed URLs separately without infinite loops
     - Proper cleanup and memory management
+    - Database tracking for deduplication
     """
+    
+    # Generate unique session ID for this run
+    session_id = f"session_{int(time.time())}"
+    
+    # Initialize database
+    if ENABLE_DATABASE:
+        await init_database()
     
     # Create URL to username mapping
     url_to_username = {}
@@ -670,8 +956,9 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                     stats['sent'] += len(batch_to_send)
                     sent_count += len(batch_to_send)
                     user_batch_nums[username] += 1
+                    logger.info(f"✅ Successfully sent and cleaning up batch {batch_num} for {username}")
                     
-                    # Cleanup sent images
+                    # Cleanup sent images (includes memory logging)
                     cleanup_images(batch_to_send)
                 else:
                     logger.error(f"❌ Failed to send batch {batch_num} for {username}")
@@ -726,6 +1013,11 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
         # Memory cleanup
         del successful, failed, batch_urls
         gc.collect()
+        
+        # Save batch stats to database
+        if ENABLE_DATABASE:
+            await save_batch_stats(session_id, stats['batch_num'], len(batch_urls) if 'batch_urls' in locals() else 0, 
+                                  stats['downloaded'], stats['sent'], stats['failed'])
     
     # ═══════════════════════════════════════════
     # PHASE 2: Retry failed URLs ONCE
@@ -797,7 +1089,9 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                 if success:
                     stats['sent'] += len(batch_to_send)
                     user_batch_nums[username] += 1
+                    logger.info(f"✅ Phase 3: Successfully sent batch for {username}")
                 
+                # Cleanup (includes memory logging)
                 cleanup_images(batch_to_send)
             
             # Send remaining (< 10) at the end
@@ -825,10 +1119,11 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                                 await bot.send_media_group(chat_id, media)
                             
                             stats['sent'] += len(images)
-                            logger.info(f"✅ Sent final batch for {username}")
+                            logger.info(f"✅ Sent final incomplete batch for {username}")
                     except Exception as e:
                         logger.error(f"❌ Failed to send final batch for {username}: {str(e)}")
                 
+                # Cleanup final batch (includes memory logging)
                 cleanup_images(images)
     
     stats['pending_send'] = 0
@@ -843,7 +1138,14 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
     except Exception as e:
         logger.warning(f"⚠️ Cleanup error: {str(e)}")
     
+    # Optimize database
+    if ENABLE_DATABASE:
+        await cleanup_database()
+    
+    # Final garbage collection and memory check
+    logger.info("🧹 Final cleanup - forcing garbage collection")
     gc.collect()
+    logger.info("📊 Final memory state:")
     log_memory()
     
     return stats['downloaded'], stats['sent'], total_urls
