@@ -435,8 +435,7 @@ def extract_media_from_html(raw_html: str) -> List[str]:
     for node in tree.css("*[src]"):
         src = node.attributes.get("src", "").strip()
         if src:
-            if "/vh/dli?" in src:
-                src = src.replace("/vh/dli?", "/vh/dl?")
+            # Don't convert URLs here - we'll handle video.desifakes.net URLs in store_media
             urls.add(src)
     
     # Extract from data-src
@@ -815,24 +814,25 @@ class DeepForumCrawler:
                 url = urljoin(self.base_url, url)
             
             # 🟢 Special handling for video.desifakes.net URLs — create BOTH thumbnail and video
+            # dli? = thumbnail (image), dl? = video
             if 'video.desifakes.net/vh/' in url:
-                if '/vh/dl?' in url:
-                    # Found thumbnail URL → make both
-                    thumb_url = url
-                    video_url = url.replace('/vh/dl?', '/vh/dli?')
-                elif '/vh/dli?' in url:
-                    # Found video URL → make both
-                    video_url = url
-                    thumb_url = url.replace('/vh/dli?', '/vh/dl?')
+                if '/vh/dli?' in url:
+                    # Found thumbnail URL → create both thumbnail and video
+                    thumb_url = url  # dli? is thumbnail
+                    video_url = url.replace('/vh/dli?', '/vh/dl?')  # dl? is video
+                elif '/vh/dl?' in url:
+                    # Found video URL → create both thumbnail and video
+                    video_url = url  # dl? is video
+                    thumb_url = url.replace('/vh/dl?', '/vh/dli?')  # dli? is thumbnail
                 else:
                     # Not a handled pattern
                     thumb_url = None
                     video_url = None
             
                 if thumb_url and video_url:
-                    # Add thumbnail (image) with date
+                    # Add thumbnail (dli? = image type)
                     batch_data.append((self.main_source_name, self.main_source_name, thumb_url, 'images', article_date))
-                    # Add video with date
+                    # Add video (dl? = video type)
                     batch_data.append((self.main_source_name, self.main_source_name, video_url, 'videos', article_date))
 
             
