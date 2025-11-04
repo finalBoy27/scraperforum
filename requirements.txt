@@ -10,3 +10,4 @@ TgCrypto
 Pillow
 imageio
 aiohttp
+orjson
