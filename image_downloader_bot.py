@@ -1,5 +1,5 @@
 import asyncio
-import httpx
+import aiohttp
 import re
 import os
 import json
@@ -54,12 +54,16 @@ API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7841933095:AAEz5SLNiGzWanheul1bwZL4HJbQBOBROqw")
 
 # === DOWNLOAD SETTINGS ===
-TIMEOUT = [12.0, 15.0, 18.0, 21.0]   # HTTP request timeout per attempt (seconds) - grows dynamically
+TOTAL_TIMEOUT = 60.0                 # Total timeout for entire request (seconds)
+CONNECT_TIMEOUT = 10.0               # Connection timeout (seconds)
+SOCK_READ_TIMEOUT = 30.0             # Socket read timeout (seconds)
 MAX_DOWNLOAD_RETRIES = 4             # How many times to retry a failed download
 RETRY_DELAY = [0.5, 0.7, 0.9, 1.0]   # Wait time between retries per attempt (seconds) - exponential backoff
-DELAY_BETWEEN_REQUESTS = 0.3         # Delay between concurrent download requests
-MAX_CONCURRENT_WORKERS = 10          # Maximum concurrent downloads
+DELAY_BETWEEN_REQUESTS = 0.2         # Delay between concurrent download requests (faster with aiohttp)
+MAX_CONCURRENT_WORKERS = 10          # Maximum concurrent downloads (increased for aiohttp)
 BATCH_DOWNLOAD_SIZE = 10             # Download this many URLs at once
+TCP_CONNECTOR_LIMIT = 100            # TCP connection pool limit
+TCP_CONNECTOR_LIMIT_PER_HOST = 30    # TCP connections per host
 
 # === SEND SETTINGS ===
 BATCH_SEND_SIZE = 10                 # Must accumulate 10 images before sending (Telegram media group limit)
@@ -471,13 +475,50 @@ def normalize_image_extension(filepath):
 # ───────────────────────────────
 # 🧩 UTILITIES
 # ───────────────────────────────
+
+# Global aiohttp session (reuse connections for speed)
+_aiohttp_session = None
+
+async def get_aiohttp_session():
+    """Get or create global aiohttp session with optimized settings"""
+    global _aiohttp_session
+    if _aiohttp_session is None or _aiohttp_session.closed:
+        timeout = aiohttp.ClientTimeout(
+            total=TOTAL_TIMEOUT,
+            connect=CONNECT_TIMEOUT,
+            sock_read=SOCK_READ_TIMEOUT
+        )
+        connector = aiohttp.TCPConnector(
+            limit=TCP_CONNECTOR_LIMIT,
+            limit_per_host=TCP_CONNECTOR_LIMIT_PER_HOST,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True
+        )
+        _aiohttp_session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+            raise_for_status=False
+        )
+        logger.info("✅ Created optimized aiohttp session")
+    return _aiohttp_session
+
 async def fetch_html(url: str):
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(url, follow_redirects=True, timeout=TIMEOUT)
-            return r.text if r.status_code == 200 else ""
+        session = await get_aiohttp_session()
+        logger.debug(f"🌐 Fetching HTML from: {url}")
+        async with session.get(url, allow_redirects=True) as response:
+            if response.status == 200:
+                text = await response.text()
+                logger.debug(f"✅ HTML fetched successfully ({len(text)} chars)")
+                return text
+            else:
+                logger.warning(f"⚠️ HTTP {response.status} for HTML fetch: {url}")
+                return ""
+    except asyncio.TimeoutError:
+        logger.error(f"⏱️ Timeout fetching HTML from {url}")
+        return ""
     except Exception as e:
-        logger.error(f"Fetch error for {url}: {e}")
+        logger.error(f"❌ Fetch error for {url}: {e}")
         return ""
 
 def extract_media_data_from_html(html_str: str):
@@ -589,13 +630,13 @@ def filter_and_deduplicate_urls(username_images):
     return filtered_username_images, all_urls
 
 async def download_image(url, temp_dir, semaphore, url_metadata=None):
-    """Download single image/video/gif with retries and conversion"""
+    """Download single image/video/gif with retries and conversion using aiohttp"""
     async with semaphore:
         await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
         
         # Check if already downloaded in database
         if ENABLE_DATABASE and await check_url_downloaded(url):
-            logger.info(f"ℹ️ URL already downloaded (from DB): {url}")
+            logger.debug(f"ℹ️ URL already downloaded (from DB): {url}")
             return None
         
         username = url_metadata.get('username') if url_metadata else 'Unknown'
@@ -605,20 +646,27 @@ async def download_image(url, temp_dir, semaphore, url_metadata=None):
         elif is_gif_url(url):
             media_type = 'gif'
         
+        session = await get_aiohttp_session()
+        
         for attempt in range(MAX_DOWNLOAD_RETRIES):
-            current_timeout = TIMEOUT[min(attempt, len(TIMEOUT) - 1)]
             current_retry_delay = RETRY_DELAY[min(attempt, len(RETRY_DELAY) - 1)]
             
             try:
-                async with httpx.AsyncClient() as client:
-                    r = await client.get(url, timeout=current_timeout, follow_redirects=True)
+                logger.debug(f"🔽 Downloading (attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES}): {url}")
+                start_time = time.time()
+                
+                async with session.get(url, allow_redirects=True) as response:
+                    download_time = time.time() - start_time
                     
-                    if r.status_code == 200:
-                        content = r.content
-                        if len(content) < MIN_IMAGE_SIZE:
-                            logger.warning(f"⚠️ Content too small ({len(content)} bytes): {url}")
+                    if response.status == 200:
+                        content = await response.read()
+                        content_size = len(content)
+                        logger.debug(f"⬇️ Downloaded {content_size} bytes in {download_time:.2f}s from: {url}")
+                        
+                        if content_size < MIN_IMAGE_SIZE:
+                            logger.warning(f"⚠️ Content too small ({content_size} bytes): {url}")
                             if ENABLE_DATABASE:
-                                await mark_url_downloaded(url, username, None, len(content), media_type, 
+                                await mark_url_downloaded(url, username, None, content_size, media_type, 
                                                         status='failed', error_msg='Content too small')
                             return None
                         
@@ -640,11 +688,13 @@ async def download_image(url, temp_dir, semaphore, url_metadata=None):
                                     break
                         
                         # Save to temp file
-                        filename = f"temp_{int(time.time() * 1000000)}_{len(content)}{file_ext}"
+                        filename = f"temp_{int(time.time() * 1000000)}_{content_size}{file_ext}"
                         filepath = os.path.join(temp_dir, filename)
                         
                         with open(filepath, 'wb') as f:
                             f.write(content)
+                        
+                        logger.debug(f"💾 Saved to: {filepath}")
                         
                         # Clear content from memory immediately
                         del content
@@ -682,7 +732,7 @@ async def download_image(url, temp_dir, semaphore, url_metadata=None):
                             return None
                         
                         final_size = os.path.getsize(filepath)
-                        logger.info(f"✅ Downloaded & processed ({final_size} bytes): {url}")
+                        logger.info(f"✅ Downloaded & processed ({final_size} bytes, {download_time:.2f}s): {url}")
                         
                         # Mark as successfully downloaded in database
                         if ENABLE_DATABASE:
@@ -697,25 +747,33 @@ async def download_image(url, temp_dir, semaphore, url_metadata=None):
                         
                         return result
                     
-                    elif r.status_code == 404:
+                    elif response.status == 404:
                         logger.info(f"ℹ️ 404 Not Found: {url}")
                         if ENABLE_DATABASE:
                             await mark_url_downloaded(url, username, None, 0, media_type, 
                                                     status='failed', error_msg='404 Not Found')
                         return None  # Not retryable
                     else:
-                        logger.warning(f"⚠️ HTTP {r.status_code} for {url} (attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES})")
+                        wait_msg = f" (waiting {current_retry_delay}s before retry)" if attempt < MAX_DOWNLOAD_RETRIES - 1 else ""
+                        logger.warning(f"⚠️ HTTP {response.status} for {url} (attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES}){wait_msg}")
                 
             except asyncio.TimeoutError:
-                logger.warning(f"⏱️ Timeout for {url} (attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES}, timeout={current_timeout}s)")
+                elapsed = time.time() - start_time
+                wait_msg = f" → Waiting {current_retry_delay}s before retry" if attempt < MAX_DOWNLOAD_RETRIES - 1 else ""
+                logger.warning(f"⏱️ Timeout after {elapsed:.1f}s for {url} (attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES}){wait_msg}")
+            except aiohttp.ClientError as e:
+                wait_msg = f" → Waiting {current_retry_delay}s" if attempt < MAX_DOWNLOAD_RETRIES - 1 else ""
+                logger.warning(f"⚠️ Network error for {url} (attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES}): {type(e).__name__}{wait_msg}")
             except Exception as e:
-                logger.warning(f"⚠️ Download error for {url} (attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES}): {str(e)}")
+                wait_msg = f" → Waiting {current_retry_delay}s" if attempt < MAX_DOWNLOAD_RETRIES - 1 else ""
+                logger.warning(f"⚠️ Download error for {url} (attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES}): {str(e)}{wait_msg}")
             
             # Wait before retry (except on last attempt)
             if attempt < MAX_DOWNLOAD_RETRIES - 1:
+                logger.debug(f"⏳ Sleeping {current_retry_delay}s before retry...")
                 await asyncio.sleep(current_retry_delay)
         
-        logger.error(f"❌ Failed after {MAX_DOWNLOAD_RETRIES} attempts: {url}")
+        logger.error(f"❌ PERMANENT FAILURE after {MAX_DOWNLOAD_RETRIES} attempts: {url}")
         
         # Mark as failed in database
         if ENABLE_DATABASE:
@@ -1142,6 +1200,13 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
     if ENABLE_DATABASE:
         await cleanup_database()
     
+    # Close aiohttp session
+    global _aiohttp_session
+    if _aiohttp_session and not _aiohttp_session.closed:
+        logger.info("🔌 Closing aiohttp session...")
+        await _aiohttp_session.close()
+        _aiohttp_session = None
+    
     # Final garbage collection and memory check
     logger.info("🧹 Final cleanup - forcing garbage collection")
     gc.collect()
@@ -1388,6 +1453,13 @@ async def handle_down(client: Client, message: Message):
 # ───────────────────────────────
 # MAIN
 # ───────────────────────────────
+async def cleanup_on_shutdown():
+    """Cleanup aiohttp session on shutdown"""
+    global _aiohttp_session
+    if _aiohttp_session and not _aiohttp_session.closed:
+        logger.info("🔌 Shutting down aiohttp session...")
+        await _aiohttp_session.close()
+
 if __name__ == "__main__":
     threading.Thread(target=run_fastapi, daemon=True).start()
     bot.run()
