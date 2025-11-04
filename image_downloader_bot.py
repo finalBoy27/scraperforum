@@ -865,6 +865,23 @@ class DeepForumCrawler:
 
 # ========== HTML GENERATOR ==========
 
+def convert_to_proxy_url(url: str) -> str:
+    """Convert pornbb.xyz image URLs to proxy URLs"""
+    try:
+        # Check if URL is from pornbb.xyz
+        if 'pornbb.xyz/images/' in url.lower():
+            # URL encode the original URL
+            from urllib.parse import quote
+            encoded_url = quote(url, safe='')
+            # Return proxy URL
+            proxy_url = f"https://htmltohosing.tirev71676.workers.dev/proxy?url={encoded_url}"
+            return proxy_url
+        # Return original URL if not pornbb.xyz
+        return url
+    except Exception as e:
+        logger.warning(f"Failed to convert URL to proxy: {url}, error: {e}")
+        return url
+
 def extract_name_from_url(url: str) -> str:
     """Extract readable name from forum/thread URL"""
     try:
@@ -910,6 +927,9 @@ async def generate_html_gallery(db_path: str, source_urls: List[str]) -> Optiona
                 continue
             
             try:
+                # Convert pornbb.xyz URLs to proxy URLs
+                clean_url = convert_to_proxy_url(clean_url)
+                
                 # Ensure URL is properly escaped for JSON
                 safe_src = clean_url.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '').replace('\r', '')
                 
