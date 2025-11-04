@@ -611,7 +611,7 @@ class DeepForumCrawler:
             await asyncio.gather(*tasks)
     
     async def process_thread(self, http_client: AsyncForumHTTPClient, thread_url: str, semaphore, progress_callback=None):
-        """Process a single thread and extract media from ALL pages and ALL articles (optimized version)"""
+        """Process a single thread and extract media from ALL pages and ALL articles (accurate counting version)"""
         async with semaphore:
             # Fetch first page
             html, status, title = await http_client.fetch_with_retry(thread_url, self.stats)
@@ -625,6 +625,10 @@ class DeepForumCrawler:
                 
                 all_media_urls = []
                 seen_in_thread = set()  # Track duplicates within thread
+                total_articles_processed = 0
+                
+                # Store media with dates
+                media_with_dates = []  # List of (url, date) tuples
                 
                 # Process all pages of this thread
                 for page_num in range(1, min(total_pages + 1, MAX_PAGES_PER_THREAD + 1)):
@@ -655,21 +659,26 @@ class DeepForumCrawler:
                             articles = tree.css("article")
                         
                         page_media_count = 0
+                        articles_on_page = len(articles)
+                        total_articles_processed += articles_on_page
                         
                         for article in articles:
                             if not article or not article.html:
                                 continue
                             
-                            # Extract accurate post date from article
+                            # Extract accurate date from article header
                             article_date = datetime.now().strftime("%Y-%m-%d")
-                            date_tag = article.css_first("time.u-dt")
-                            if date_tag and "datetime" in date_tag.attributes:
-                                try:
-                                    dt_str = date_tag.attributes["datetime"]
-                                    # Parse ISO format with timezone (e.g., "2023-06-15T11:10:59+0530")
-                                    article_date = datetime.fromisoformat(dt_str.replace('+0530', '+05:30')).strftime("%Y-%m-%d")
-                                except Exception as e:
-                                    logger.debug(f"Failed to parse date {date_tag.attributes.get('datetime')}: {e}")
+                            try:
+                                # Look for time tag in header
+                                header = article.css_first("header.message-attribution")
+                                if header:
+                                    time_tag = header.css_first("time.u-dt")
+                                    if time_tag and "datetime" in time_tag.attributes:
+                                        dt_str = time_tag.attributes["datetime"]
+                                        # Parse datetime: "2023-06-15T11:10:59+0530"
+                                        article_date = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S%z").strftime("%Y-%m-%d")
+                            except Exception as e:
+                                logger.debug(f"Failed to extract date from article: {e}")
                             
                             # Extract images
                             for img in article.css('img[src]'):
@@ -693,7 +702,8 @@ class DeepForumCrawler:
                                 
                                 # Deduplicate within thread
                                 if src not in seen_in_thread:
-                                    all_media_urls.append((src, article_date))
+                                    all_media_urls.append(src)
+                                    media_with_dates.append((src, article_date))
                                     seen_in_thread.add(src)
                                     page_media_count += 1
                             
@@ -717,13 +727,14 @@ class DeepForumCrawler:
                                 
                                 # Deduplicate within thread
                                 if src not in seen_in_thread:
-                                    all_media_urls.append((src, article_date))
+                                    all_media_urls.append(src)
+                                    media_with_dates.append((src, article_date))
                                     seen_in_thread.add(src)
                                     page_media_count += 1
                         
                         # Log progress every 10 pages or at milestones
                         if page_num % 10 == 0 or page_num == total_pages or page_num <= 5:
-                            logger.info(f"Page {page_num}/{total_pages}: Extracted {len(all_media_urls)} media items (+{page_media_count} new)")
+                            logger.info(f"Page {page_num}/{total_pages}: {articles_on_page} articles, {len(all_media_urls)} total media (+{page_media_count} new)")
                         
                     except Exception as e:
                         logger.error(f"Error processing articles on page {page_num}: {e}")
@@ -736,12 +747,15 @@ class DeepForumCrawler:
                     if page_num % 20 == 0 and progress_callback:
                         await progress_callback()
                 
-                logger.info(f"Thread {thread_url}: Total {len(all_media_urls)} unique media items from {total_pages} pages")
+                logger.info(f"Thread {thread_url}: {total_articles_processed} articles processed, {len(all_media_urls)} unique media items from {total_pages} pages")
                 
-                # Store all media from all pages (deduplicated in database)
+                # Store all media from all pages and get actual count stored
+                actual_stored = 0
                 if all_media_urls:
-                    await self.store_media(thread_url, title, all_media_urls)
-                    self.stats.media_extracted += len(all_media_urls)
+                    actual_stored = await self.store_media(thread_url, title, media_with_dates)
+                    # Update stats with actual stored count (after deduplication)
+                    self.stats.media_extracted += actual_stored
+                    logger.info(f"Thread {thread_url}: Stored {actual_stored} unique media items (after global deduplication)")
                 else:
                     logger.warning(f"No media found in thread {thread_url}")
                 
@@ -781,23 +795,14 @@ class DeepForumCrawler:
             await db.execute('CREATE INDEX IF NOT EXISTS idx_type ON media(media_type)')
             await db.commit()
     
-    async def store_media(self, thread_url: str, thread_title: str, media_urls: List[Tuple[str, str]]):
-        """Store media URLs in database with main source name and accurate dates (optimized batch insert)"""
-        if not media_urls:
-            return
+    async def store_media(self, thread_url: str, thread_title: str, media_with_dates: List[Tuple[str, str]]) -> int:
+        """Store media URLs with dates in database (returns actual count stored after deduplication)"""
+        if not media_with_dates:
+            return 0
         
         # Prepare batch data
         batch_data = []
-        seen_urls = set()  # Track URLs to avoid duplicate counting
-        
-        for url_data in media_urls:
-            # Extract URL and date
-            if isinstance(url_data, tuple):
-                url, post_date = url_data
-            else:
-                url = url_data
-                post_date = datetime.now().strftime("%Y-%m-%d")
-            
+        for url, article_date in media_with_dates:
             # Clean URL
             url = url.strip()
             if url.startswith('%22') and url.endswith('%22'):
@@ -809,51 +814,54 @@ class DeepForumCrawler:
                 # Make absolute URL
                 url = urljoin(self.base_url, url)
             
-            # Special handling for video.desifakes.net URLs - create BOTH thumbnail and video
+            # 🟢 Special handling for video.desifakes.net URLs — create BOTH thumbnail and video
             if 'video.desifakes.net/vh/' in url:
                 if '/vh/dl?' in url:
-                    # This is thumbnail (/vh/dl? = image), create both
+                    # Found thumbnail URL → make both
                     thumb_url = url
                     video_url = url.replace('/vh/dl?', '/vh/dli?')
                 elif '/vh/dli?' in url:
-                    # This is video (/vh/dli? = video), create both
+                    # Found video URL → make both
                     video_url = url
                     thumb_url = url.replace('/vh/dli?', '/vh/dl?')
                 else:
-                    # Not a handled pattern, skip special processing
+                    # Not a handled pattern
                     thumb_url = None
                     video_url = None
-                
+            
                 if thumb_url and video_url:
-                    # Only add if not already seen (avoid duplicate counting)
-                    if thumb_url not in seen_urls:
-                        batch_data.append((self.main_source_name, self.main_source_name, thumb_url, 'images', post_date))
-                        seen_urls.add(thumb_url)
-                    if video_url not in seen_urls:
-                        batch_data.append((self.main_source_name, self.main_source_name, video_url, 'videos', post_date))
-                        seen_urls.add(video_url)
+                    # Add thumbnail (image) with date
+                    batch_data.append((self.main_source_name, self.main_source_name, thumb_url, 'images', article_date))
+                    # Add video with date
+                    batch_data.append((self.main_source_name, self.main_source_name, video_url, 'videos', article_date))
+
             
             # Regular media type detection for other URLs
-            elif url not in seen_urls:
-                if '.gif' in url.lower():
-                    batch_data.append((self.main_source_name, self.main_source_name, url, 'gifs', post_date))
-                elif '.mp4' in url.lower() or '.mov' in url.lower() or '.avi' in url.lower() or '.mkv' in url.lower() or '.webm' in url.lower():
-                    batch_data.append((self.main_source_name, self.main_source_name, url, 'videos', post_date))
-                else:
-                    # Default to images
-                    batch_data.append((self.main_source_name, self.main_source_name, url, 'images', post_date))
-                seen_urls.add(url)
+            elif '.gif' in url.lower():
+                batch_data.append((self.main_source_name, self.main_source_name, url, 'gifs', article_date))
+            elif '.mp4' in url.lower() or '.mov' in url.lower() or '.avi' in url.lower() or '.mkv' in url.lower() or '.webm' in url.lower():
+                batch_data.append((self.main_source_name, self.main_source_name, url, 'videos', article_date))
+            else:
+                # Default to images
+                batch_data.append((self.main_source_name, self.main_source_name, url, 'images', article_date))
         
-        # Batch insert for performance
+        # Batch insert for performance and track actual inserts
+        actual_stored = 0
         async with aiosqlite.connect(self.db_path) as db:
             try:
-                await db.executemany(
-                    'INSERT OR IGNORE INTO media (thread_url, thread_title, media_url, media_type, scraped_at) VALUES (?, ?, ?, ?, ?)',
-                    batch_data
-                )
+                # Insert and count successful insertions
+                for data in batch_data:
+                    cursor = await db.execute(
+                        'INSERT OR IGNORE INTO media (thread_url, thread_title, media_url, media_type, scraped_at) VALUES (?, ?, ?, ?, ?)',
+                        data
+                    )
+                    if cursor.rowcount > 0:
+                        actual_stored += 1
                 await db.commit()
             except Exception as e:
                 logger.warning(f"Failed to store media batch: {e}")
+        
+        return actual_stored
 
 # ========== HTML GENERATOR ==========
 
@@ -875,13 +883,12 @@ def extract_name_from_url(url: str) -> str:
         return url
 
 async def generate_html_gallery(db_path: str, source_urls: List[str]) -> Optional[str]:
-    """Generate HTML gallery from database with ONE button per input URL and accurate counting"""
+    """Generate HTML gallery from database with ONE button per input URL"""
     logger.info("Generating HTML gallery...")
     
     # Fetch all media from database grouped by main source (input URL)
     media_by_source = defaultdict(lambda: {'images': {}, 'videos': {}, 'gifs': {}})
     total_count = 0
-    seen_video_pairs = set()  # Track video.desifakes.net pairs to avoid double counting
     
     async with aiosqlite.connect(db_path) as db:
         cursor = await db.execute('SELECT thread_url, thread_title, media_url, media_type, scraped_at FROM media ORDER BY scraped_at DESC')
@@ -906,32 +913,15 @@ async def generate_html_gallery(db_path: str, source_urls: List[str]) -> Optiona
                 # Ensure URL is properly escaped for JSON
                 safe_src = clean_url.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '').replace('\r', '')
                 
-                # Get date (now using actual post date from scraped_at)
+                # Get date
                 date = scraped_at[:10] if scraped_at else datetime.now().strftime("%Y-%m-%d")
-                
-                # Special handling for video.desifakes.net to avoid double counting
-                is_video_pair = False
-                if 'video.desifakes.net/vh/' in clean_url:
-                    # Extract base identifier (without /vh/dl? or /vh/dli?)
-                    base_id = clean_url.split('/vh/')[0] + '/vh/' + clean_url.split('/vh/')[1].split('?', 1)[1] if '?' in clean_url else clean_url
-                    
-                    if base_id not in seen_video_pairs:
-                        seen_video_pairs.add(base_id)
-                        is_video_pair = True
-                
-                # Only count once for video.desifakes.net pairs, or always for other media
-                should_count = is_video_pair if 'video.desifakes.net/vh/' in clean_url else True
                 
                 # Store by date for this source
                 if date not in media_by_source[source_name][media_type]:
                     media_by_source[source_name][media_type][date] = []
                 
                 media_by_source[source_name][media_type][date].append(safe_src)
-                
-                # Only increment count for unique items
-                if should_count:
-                    total_count += 1
-                    
+                total_count += 1
             except Exception as e:
                 logger.error(f"Failed to process media item: {media_url}, error: {e}")
                 continue
@@ -940,14 +930,13 @@ async def generate_html_gallery(db_path: str, source_urls: List[str]) -> Optiona
         logger.warning("No media found in database")
         return None
     
-    logger.info(f"Generating HTML with {total_count} unique media items from {len(media_by_source)} sources")
+    logger.info(f"Generating HTML with {total_count} media items from {len(media_by_source)} sources")
     
     # Prepare media data (one button per input URL)
     media_data = {}
     media_counts = {}
     total_type_counts = {'images': 0, 'videos': 0, 'gifs': 0}
     year_counts = {}
-    counted_pairs = set()  # Track counted video pairs
     
     for source_name in sorted(media_by_source.keys()):
         media_by_date = media_by_source[source_name]
@@ -962,25 +951,12 @@ async def generate_html_gallery(db_path: str, source_urls: List[str]) -> Optiona
                         'src': url,
                         'date': date
                     })
+                    count += 1
+                    total_type_counts[media_type] += 1
                     
-                    # Smart counting for video.desifakes.net pairs
-                    should_count_type = True
-                    if 'video.desifakes.net/vh/' in url:
-                        # Extract base identifier
-                        base_id = url.split('/vh/')[0] + '/vh/' + url.split('/vh/')[1].split('?', 1)[1] if '?' in url else url
-                        
-                        if base_id in counted_pairs:
-                            should_count_type = False
-                        else:
-                            counted_pairs.add(base_id)
-                    
-                    if should_count_type:
-                        count += 1
-                        total_type_counts[media_type] += 1
-                        
-                        # Year counts
-                        year = date.split('-')[0]
-                        year_counts[year] = year_counts.get(year, 0) + 1
+                    # Year counts
+                    year = date.split('-')[0]
+                    year_counts[year] = year_counts.get(year, 0) + 1
         
         media_list = sorted(media_list, key=lambda x: x['date'], reverse=True)
         safe_name = source_name.replace(' ', '_')
