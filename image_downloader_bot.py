@@ -789,23 +789,27 @@ class DeepForumCrawler:
                 # Make absolute URL
                 url = urljoin(self.base_url, url)
             
-            # Special handling for video.desifakes.net URLs - create BOTH thumbnail and video
-            if 'video.desifakes.net/vh/dl' in url or 'video.desifakes.net/vh/dli' in url:
-                # Extract the encoded part
-                # Convert to both formats
-                if '/vh/dli?' in url:
-                    # This is thumbnail, create both
+            # 🟢 Special handling for video.desifakes.net URLs — create BOTH thumbnail and video
+            if 'video.desifakes.net/vh/' in url:
+                if '/vh/dl?' in url:
+                    # Found thumbnail URL → make both
                     thumb_url = url
-                    video_url = url.replace('/vh/dli?', '/vh/dl?')
-                else:
-                    # This is video, create both
+                    video_url = url.replace('/vh/dl?', '/vh/dli?')
+                elif '/vh/dli?' in url:
+                    # Found video URL → make both
                     video_url = url
-                    thumb_url = url.replace('/vh/dl?', '/vh/dli?')
-                
-                # Add thumbnail as image
-                batch_data.append((self.main_source_name, self.main_source_name, thumb_url, 'images'))
-                # Add video as video
-                batch_data.append((self.main_source_name, self.main_source_name, video_url, 'videos'))
+                    thumb_url = url.replace('/vh/dli?', '/vh/dl?')
+                else:
+                    # Not a handled pattern
+                    thumb_url = None
+                    video_url = None
+            
+                if thumb_url and video_url:
+                    # Add thumbnail (image)
+                    batch_data.append((self.main_source_name, self.main_source_name, thumb_url, 'images'))
+                    # Add video
+                    batch_data.append((self.main_source_name, self.main_source_name, video_url, 'videos'))
+
             
             # Regular media type detection for other URLs
             elif '.gif' in url.lower():
