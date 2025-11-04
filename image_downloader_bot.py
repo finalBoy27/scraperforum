@@ -98,7 +98,7 @@ UPLOAD_HOSTS = [
 ]
 
 # ========== HEALTH CHECK SETTINGS ==========
-HEALTH_CHECK_PORT = int(os.getenv("PORT", 10000))
+HEALTH_CHECK_PORT = int(os.getenv("PORT", 8080))  # Changed from 10000 to 8080
 HEALTH_CHECK_HOST = '0.0.0.0'
 
 # ========== HEALTH CHECK APP ==========
@@ -789,15 +789,32 @@ class DeepForumCrawler:
                 # Make absolute URL
                 url = urljoin(self.base_url, url)
             
-            # Determine type
-            if 'vh/dl?url' in url or '.mp4' in url.lower():
-                typ = 'videos'
-            elif '.gif' in url.lower():
-                typ = 'gifs'
-            else:
-                typ = 'images'
+            # Special handling for video.desifakes.net URLs - create BOTH thumbnail and video
+            if 'video.desifakes.net/vh/dl' in url or 'video.desifakes.net/vh/dli' in url:
+                # Extract the encoded part
+                # Convert to both formats
+                if '/vh/dli?' in url:
+                    # This is thumbnail, create both
+                    thumb_url = url
+                    video_url = url.replace('/vh/dli?', '/vh/dl?')
+                else:
+                    # This is video, create both
+                    video_url = url
+                    thumb_url = url.replace('/vh/dl?', '/vh/dli?')
+                
+                # Add thumbnail as image
+                batch_data.append((self.main_source_name, self.main_source_name, thumb_url, 'images'))
+                # Add video as video
+                batch_data.append((self.main_source_name, self.main_source_name, video_url, 'videos'))
             
-            batch_data.append((self.main_source_name, self.main_source_name, url, typ))
+            # Regular media type detection for other URLs
+            elif '.gif' in url.lower():
+                batch_data.append((self.main_source_name, self.main_source_name, url, 'gifs'))
+            elif '.mp4' in url.lower() or '.mov' in url.lower() or '.avi' in url.lower() or '.mkv' in url.lower() or '.webm' in url.lower():
+                batch_data.append((self.main_source_name, self.main_source_name, url, 'videos'))
+            else:
+                # Default to images
+                batch_data.append((self.main_source_name, self.main_source_name, url, 'images'))
         
         # Batch insert for performance
         async with aiosqlite.connect(self.db_path) as db:
