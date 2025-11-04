@@ -1,29 +1,26 @@
 import asyncio
-import aiohttp
+import httpx
 import re
 import os
 import json
 import time
 import html
+import math
 import gc
 import logging
-import aioshutil
-import random
 from urllib.parse import urlencode, urljoin
 from selectolax.parser import HTMLParser
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 from pyrogram import Client, filters
-from pyrogram.types import Update, Message, InputMediaPhoto
-from pyrogram.raw.functions.channels import CreateForumTopic
-from pyrogram.errors import FloodWait
-import aiosqlite
+from pyrogram.types import Update, Message
 from fastapi import FastAPI
 import uvicorn
 import threading
-from PIL import Image
-import imageio.v3 as iio
+import aiosqlite
+from collections import defaultdict
+import orjson  # Faster JSON library
 
 # Health check app
 app = FastAPI()
@@ -37,76 +34,62 @@ def health():
     return {"status": "OK"}
 
 def run_fastapi():
-    uvicorn.run(app, host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
+    port = int(os.getenv("PORT", 10000))
+    try:
+        uvicorn.run(app, host='0.0.0.0', port=port, log_level="error")
+    except Exception as e:
+        logger.error(f"FastAPI error: {e}")
 
 # Disable FastAPI logs if needed, but for now keep
-logging.getLogger('uvicorn').disabled = True  # optional
+# logging.getLogger('uvicorn').disabled = True  # optional
 
 threading.Thread(target=run_fastapi, daemon=True).start()
 
 # ───────────────────────────────
-# ⚙️ CONFIG - ALL IMPORTANT VARIABLES
+# ⚙️ CONFIG
 # ───────────────────────────────
+BASE_URL = "https://desifakes.com"
+INITIAL_SEARCH_ID = "46509052"
+ORDER = "date"
+NEWER_THAN = "2019"
+OLDER_THAN = "2025"
+TIMEOUT = [5.0, 10.0, 15.0]
+DELAY_BETWEEN_REQUESTS = 0.3
+TEMP_DB = "Scraping/tempMedia.db"
+MAX_CONCURRENT_WORKERS = 12  # Optimized for better performance
+MAX_RETRIES = 3
+RETRY_DELAY = [1.0, 1.5, 2.0]
 
-# === TELEGRAM CREDENTIALS ===
+VALID_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "mp4", "mov", "avi", "mkv", "webm"]
+EXCLUDE_PATTERNS = ["/data/avatars/", "/data/assets/", "/data/addonflare/"]
+
+# HTML Gallery Config
+OUTPUT_FILE = "Scraping/final_full_gallery.html"
+MAX_FILE_SIZE_MB = 100
+MAX_PAGINATION_RANGE = 100
+
+# Upload Config
+UPLOAD_FILE = "Scraping/final_full_gallery.html"
+MAX_MB = 100
+HOSTS = [
+    {"name":"HTML Hosting","url":"https://html-hosting.tirev71676.workers.dev/api/upload","field":"file"},
+    {"name":"Litterbox","url":"https://litterbox.catbox.moe/resources/internals/api.php","field":"fileToUpload","data":{"reqtype":"fileupload","time":"72h"}},
+    {"name":"Catbox","url":"https://catbox.moe/user/api.php","field":"fileToUpload","data":{"reqtype":"fileupload"}}
+]
+
 API_ID = int(os.getenv("API_ID", 24536446))
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7841933095:AAEz5SLNiGzWanheul1bwZL4HJbQBOBROqw")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8097154751:AAGdE2IBcRElV1w_zHVwGu3N_utMkOyMpn0")
 
-# === DOWNLOAD SETTINGS ===
-TOTAL_TIMEOUT = 60.0                 # Total timeout for entire request (seconds)
-CONNECT_TIMEOUT = 10.0               # Connection timeout (seconds)
-SOCK_READ_TIMEOUT = 30.0             # Socket read timeout (seconds)
-MAX_DOWNLOAD_RETRIES = 4             # How many times to retry a failed download
-RETRY_DELAY = [0.5, 0.7, 0.9, 1.0]   # Wait time between retries per attempt (seconds) - exponential backoff
-DELAY_BETWEEN_REQUESTS = 0.2         # Delay between concurrent download requests (faster with aiohttp)
-MAX_CONCURRENT_WORKERS = 10          # Maximum concurrent downloads (increased for aiohttp)
-BATCH_DOWNLOAD_SIZE = 10             # Download this many URLs at once
-TCP_CONNECTOR_LIMIT = 100            # TCP connection pool limit
-TCP_CONNECTOR_LIMIT_PER_HOST = 30    # TCP connections per host
+bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# === SEND SETTINGS ===
-BATCH_SEND_SIZE = 10                 # Must accumulate 10 images before sending (Telegram media group limit)
-SEND_DELAY = 1.5                     # Delay between sending media groups (seconds) to avoid rate limits
-SEND_SEMAPHORE = asyncio.Semaphore(1)  # Limit concurrent sends to prevent rate limits
-MIN_IMAGE_SIZE = 100                 # Minimum image size in bytes (filter out tiny images)
-
-# === MEDIA CONVERSION SETTINGS ===
-ENABLE_GIF_CONVERSION = True         # Convert GIFs to static thumbnails
-ENABLE_VIDEO_CONVERSION = True       # Convert videos to thumbnails
-VIDEO_DOMAIN_PREFIX = "https://video.desifakes.net/vh/dli?"  # EXACT prefix for downloadable videos
-EXCLUDED_VIDEO_PREFIXES = ["https://video.desifakes.net/vh/dl?"]  # Bad video URLs to exclude
-VIDEO_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]  # Video file extensions
-GIF_EXTS = ["gif"]                   # GIF extensions
-PRESERVE_ORIGINAL_QUALITY = True     # Keep original quality without compression
-CONVERT_TO_EXTENSION = ".jpg"        # Convert all media to this extension for consistency
-
-# === FILTERING SETTINGS ===
-EXCLUDED_DOMAINS = ["pornbb.xyz"]    # Domains to exclude from download
-VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif"]
-
-# === PROGRESS & UI SETTINGS ===
-PROGRESS_UPDATE_INTERVAL = 20        # Seconds between progress message updates
-PROGRESS_PERCENT_THRESHOLD = 10      # Minimum % change to trigger update
-PROGRESS_UPDATE_DELAY = 5            # Minimum seconds between any progress update
-
-# === STORAGE SETTINGS ===
-TEMP_DIR = "temp_images"             # Temporary directory for downloaded images
-DB_DIR = "Scraping"                  # Database directory
-DB_PATH = "Scraping/media_tracking.db"  # SQLite database for tracking downloads
-ENABLE_DATABASE = True               # Enable database for tracking and deduplication
-
-# Initialize Pyrogram client
-bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+ALLOWED_CHAT_IDS = {5809601894, 1285451259}
 
 # ───────────────────────────────
 # 🧩 LOGGING SETUP
 # ───────────────────────────────
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# Suppress Pyrogram connection logs
-logging.getLogger('pyrogram').setLevel(logging.WARNING)
 
 def log_memory():
     try:
@@ -116,1350 +99,1085 @@ def log_memory():
     except ImportError:
         logger.info("psutil not available for memory tracking")
 
+# ───────────────────────────────
+# 🧩 UTILITIES
+# ───────────────────────────────
+def extract_search_id(url: str):
+    match = re.search(r"/search/(\d+)/", url)
+    return match.group(1) if match else None
+
+def build_search_url(search_id, query, newer_than, older_than, page=None, older_than_ts=None, title_only=0):
+    base_url = f"{BASE_URL}/search/{search_id}/"
+    params = {"q": query, "o": ORDER}
+    if older_than_ts:
+        params["c[older_than]"] = older_than_ts
+    else:
+        params["c[newer_than]"] = f"{newer_than}-01-01"
+        params["c[older_than]"] = f"{older_than}-12-31"
+    if title_only == 1:
+        params["c[title_only]"] = 1
+    if page:
+        params["page"] = page
+    return f"{base_url}?{urlencode(params)}"
+
+def find_view_older_link(html_str: str, title_only: int = 0):
+    tree = HTMLParser(html_str)
+    link_node = tree.css_first("div.block-footer a")
+    if not link_node or not link_node.attributes.get("href"):
+        return None
+    href = link_node.attributes["href"]
+    match = re.search(r"/search/(\d+)/older.*?before=(\d+).*?[&?]q=([^&]+)", href)
+    if not match:
+        return None
+    sid, before, q = match.groups()
+    if title_only == 1:
+        return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date&c[title_only]=1"
+    return f"{BASE_URL}/search/{sid}/?q={q}&c[older_than]={before}&o=date"
+
+def get_total_pages(html_str: str):
+    tree = HTMLParser(html_str)
+    nav = tree.css_first("ul.pageNav-main")
+    if not nav:
+        return 1
+    pages = [int(a.text(strip=True)) for a in nav.css("li.pageNav-page a") if a.text(strip=True).isdigit()]
+    return max(pages) if pages else 1
+
+def extract_threads(html_str: str):
+    tree = HTMLParser(html_str)
+    threads = []
+    for a in tree.css("a[href]"):
+        href = a.attributes.get("href", "")
+        if "threads/" in href and not href.startswith("#") and "page-" not in href:
+            full_link = urljoin(BASE_URL, href)
+            if full_link not in threads:
+                threads.append(full_link)
+    return threads
+
+# ───────────────────────────────
+# 🌐 FETCH
+# ───────────────────────────────
+async def fetch_page(client, url: str):
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = await client.get(url, follow_redirects=True, timeout=TIMEOUT[attempt-1])
+            return {"ok": r.status_code == 200, "html": r.text, "final_url": str(r.url)}
+        except Exception as e:
+            logger.error(f"Fetch attempt {attempt} failed for {url}: {e}")
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_DELAY[attempt-1])
+            else:
+                logger.error(f"All retries failed for {url}")
+                return {"ok": False, "html": "", "final_url": url}
+
+# ───────────────────────────────
+# 📦 ARTICLE PROCESSOR WITH RETRIES
+# ───────────────────────────────
+async def make_request(client: httpx.AsyncClient, url: str, retries=MAX_RETRIES) -> str:
+    for attempt in range(1, retries + 1):
+        try:
+            resp = await client.get(url, follow_redirects=True, timeout=TIMEOUT[attempt-1])
+            resp.raise_for_status()
+            return resp.text
+        except Exception as e:
+            logger.warning(f"Attempt {attempt} failed for {url}: {e}")
+            if attempt < retries:
+                await asyncio.sleep(RETRY_DELAY[attempt-1])
+            else:
+                logger.error(f"All retries failed for {url}")
+                return ""
+
+def article_matches_patterns(article, patterns):
+    try:
+        article_text = article.text(separator=" ").strip().lower()
+    except Exception:
+        article_text = (article.html or "").lower()
+    
+    for pat in patterns:
+        if pat.search(article_text):
+            return True
+    
+    for el in article.css("*"):
+        try:
+            el_text = el.text(separator=" ").strip().lower()
+            for pat in patterns:
+                if pat.search(el_text):
+                    return True
+        except Exception:
+            pass
+    return False
+
+async def process_thread(client: httpx.AsyncClient, post_url, patterns, semaphore):
+    async with semaphore:
+        html_str = await make_request(client, post_url)
+        if not html_str:
+            return []
+        
+        tree = HTMLParser(html_str)
+        articles = tree.css("article.message--post")
+        matched = []
+        
+        for article in articles:
+            post_id = article.attributes.get("data-content", "").replace("post-", "") or "unknown"
+            if post_id == "unknown":
+                continue
+            
+            is_match = article_matches_patterns(article, patterns)
+            thread_match = re.search(r"/threads/([^/]+)\.(\d+)/?", post_url)
+            
+            if thread_match:
+                slug = thread_match.group(1)
+                tid = thread_match.group(2)
+                post_url_full = f"{BASE_URL}/threads/{slug}.{tid}/post-{post_id}"
+            else:
+                post_url_full = post_url
+            
+            date_tag = article.css_first("time.u-dt")
+            post_date = datetime.now().strftime("%Y-%m-%d")
+            if date_tag and "datetime" in date_tag.attributes:
+                try:
+                    post_date = datetime.strptime(date_tag.attributes["datetime"], "%Y-%m-%dT%H:%M:%S%z").strftime("%Y-%m-%d")
+                except:
+                    pass
+            
+            matched.append({
+                "url": post_url_full,
+                "post_id": post_id,
+                "matched": is_match,
+                "post_date": post_date,
+                "article_html": article.html
+            })
+        
+        return [a for a in matched if a["matched"]] or matched
+
+async def process_threads_concurrent(thread_urls, patterns):
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+    # Optimized client with connection pooling
+    limits = httpx.Limits(max_keepalive_connections=20, max_connections=100)
+    async with httpx.AsyncClient(limits=limits) as client:
+        tasks = [process_thread(client, url, patterns, semaphore) for url in thread_urls]
+        results = await asyncio.gather(*tasks)
+    return [item for sublist in results for item in sublist]
+
+# ───────────────────────────────
+# 🎬 MEDIA EXTRACTION
+# ───────────────────────────────
+def extract_media_from_html(raw_html: str):
+    if not raw_html:
+        return []
+    
+    html_content = html.unescape(raw_html)
+    tree = HTMLParser(html_content)
+    urls = set()
+    
+    for node in tree.css("*[src]"):
+        src = node.attributes.get("src", "").strip()
+        if src:
+            if "/vh/dli?" in src:
+                src = src.replace("/vh/dli?", "/vh/dl?")
+            urls.add(src)
+    
+    for node in tree.css("*[data-src]"):
+        ds = node.attributes.get("data-src", "").strip()
+        if ds:
+            urls.add(ds)
+    
+    for node in tree.css("*[data-video]"):
+        dv = node.attributes.get("data-video", "").strip()
+        if dv:
+            urls.add(dv)
+    
+    for node in tree.css("video, video source"):
+        src = node.attributes.get("src", "").strip()
+        if src:
+            urls.add(src)
+    
+    for node in tree.css("*[style]"):
+        style = node.attributes.get("style") or ""
+        for m in re.findall(r'url\((.*?)\)', style):
+            m = m.strip('"\' ')
+            if m:
+                urls.add(m)
+    
+    for match in re.findall(r'https?://[^\s"\'<>]+', html_content):
+        urls.add(match.strip())
+    
+    media_urls = []
+    for u in urls:
+        if u:
+            low = u.lower()
+            if ("encoded$" in low and ".mp4" in low) or any(f".{ext}" in low for ext in VALID_EXTS):
+                full_url = urljoin(BASE_URL, u) if u.startswith("/") else u
+                media_urls.append(full_url)
+    
+    return list(dict.fromkeys(media_urls))
+
+def filter_media(media_list, seen_global):
+    filtered = []
+    seen_local = set()
+    for url in media_list:
+        if any(bad in url for bad in EXCLUDE_PATTERNS):
+            continue
+        if url not in seen_local and url not in seen_global:
+            seen_local.add(url)
+            seen_global.add(url)
+            filtered.append(url)
+    return filtered
+
+# ───────────────────────────────
+# 📄 HTML GENERATOR
+# ───────────────────────────────
+def create_html(media_by_date_per_username, usernames, start_year, end_year):
+    usernames_str = ", ".join(usernames)
+    title = f"{usernames_str} - Media Gallery"
+    logger.info(f"Generating HTML for usernames: {usernames_str}")
+
+    # Prepare mediaData as a Python dictionary for JSON serialization
+    media_data = {}
+    total_items = 0
+    media_counts = {}
+    # Add type counts for all media
+    total_type_counts = {'images': 0, 'videos': 0, 'gifs': 0}
+    
+    for username in usernames:
+        media_by_date = media_by_date_per_username.get(username, {"images": {}, "videos": {}, "gifs": {}})
+        media_list = []
+        count = 0
+        user_type_counts = {'images': 0, 'videos': 0, 'gifs': 0}
+        
+        for media_type in ['images', 'videos', 'gifs']:
+            for date in sorted(media_by_date[media_type].keys(), reverse=True):
+                for item in media_by_date[media_type][date]:
+                    if not item.startswith(('http://', 'https://')):
+                        logger.warning(f"Skipping invalid URL for {username}: {item}")
+                        continue
+                    try:
+                        # Clean URL - remove any encoding artifacts
+                        clean_url = item.strip()
+                        if clean_url.startswith('%22') and clean_url.endswith('%22'):
+                            clean_url = clean_url[3:-3]
+                        if clean_url.startswith('"') and clean_url.endswith('"'):
+                            clean_url = clean_url[1:-1]
+                        
+                        # Ensure URL is properly escaped for JSON
+                        safe_src = clean_url.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '').replace('\r', '')
+                        media_list.append({
+                            'type': media_type,
+                            'src': safe_src,
+                            'date': date
+                        })
+                        count += 1
+                        user_type_counts[media_type] += 1
+                        total_type_counts[media_type] += 1
+                    except Exception as e:
+                        logger.error(f"Failed to process media item for {username}: {item}, error: {str(e)}")
+                        continue
+
+        media_list = sorted(media_list, key=lambda x: x['date'], reverse=True)
+        safe_username = username.replace(' ', '_')
+        media_data[safe_username] = media_list
+        media_counts[username] = count
+        total_items += count
+
+    if total_items == 0:
+        logger.warning(f"No media items found for {usernames_str}")
+        return None
+
+    logger.info(f"Total media items to include in HTML: {total_items}")
+
+    # Serialize mediaData to JSON to ensure valid structure
+    try:
+        # Use orjson for faster and more efficient JSON serialization
+        media_data_json = orjson.dumps(media_data).decode('utf-8')
+        json_size_mb = len(media_data_json) / (1024 * 1024)
+        logger.info(f"Media data JSON size: {json_size_mb:.2f} MB")
+        
+        if json_size_mb > MAX_FILE_SIZE_MB:
+            logger.error(f"Media data JSON size {json_size_mb:.2f} MB exceeds limit of {MAX_FILE_SIZE_MB} MB")
+            return None
+    except Exception as e:
+        logger.error(f"Failed to serialize mediaData to JSON: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+
+    # Compute year counts
+    year_counts = {}
+    for username, media_list in media_data.items():
+        for item in media_list:
+            year = item['date'].split('-')[0]
+            if year not in year_counts:
+                year_counts[year] = 0
+            year_counts[year] += 1
+    year_counts_json = orjson.dumps(year_counts).decode('utf-8')
+
+    # Calculate default itemsPerPage
+    default_items_per_page = max(1, math.ceil(total_items / MAX_PAGINATION_RANGE))
+
+    html_fragments = [f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>{html.escape(title)}</title>
+  <style>
+    body {{ background-color: #000; font-family: Arial, sans-serif; margin: 0; padding: 20px; color: white; }}
+    h1 {{ text-align: center; margin-bottom: 20px; font-size: 24px; }}
+    .button-container {{ text-align: center; margin-bottom: 20px; display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }}
+    .filter-button {{ padding: 14px 26px; margin: 6px; font-size: 18px; border-radius: 8px; border: none; background-color: #333; color: white; cursor: pointer; transition: background-color 0.3s; }}
+    .filter-button:hover {{ background-color: #555; }}
+    .filter-button.active {{ background-color: #007bff; }}
+    .number-input {{ padding: 12px; font-size: 18px; width: 80px; border-radius: 8px; border: none; background-color: #333; color: white; }}
+    .media-type-select {{ padding: 12px; font-size: 18px; border-radius: 8px; border: none; background-color: #333; color: white; }}
+    .pagination {{ text-align: center; margin: 20px 0; }}
+    .pagination-button {{ padding: 14px 24px; margin: 0 6px; font-size: 18px; border-radius: 8px; border: none; background-color: #333; color: white; cursor: pointer; transition: background-color 0.3s, transform 0.2s; }}
+    .pagination-button:hover {{ background-color: #555; transform: scale(1.05); }}
+    .pagination-button.active {{ background-color: #007bff; font-weight: bold; border: 2px solid #0056b3; }}
+    .pagination-button:disabled {{ background-color: #555; cursor: not-allowed; opacity: 0.6; }}
+    .masonry {{ display: flex; justify-content: center; gap: 10px; min-height: 100px; }}
+    .column {{ flex: 1; display: flex; flex-direction: column; gap: 10px; }}
+    .column img, .column video {{ width: 100%; border-radius: 5px; display: block; }}
+    .column video {{ background-color: #111; }}
+    .column video[title*="Video file"] {{ 
+      position: relative; 
+      cursor: pointer;
+    }}
+    .column video[title*="Video file"]::after {{ 
+      content: "🎬"; 
+      position: absolute; 
+      top: 5px; 
+      right: 5px; 
+      background-color: rgba(0,0,0,0.7); 
+      color: white; 
+      padding: 2px 5px; 
+      border-radius: 3px; 
+      font-size: 12px;
+    }}
+    @media (max-width: 768px) {{ 
+      .masonry {{ flex-direction: column; }} 
+      .filter-button {{ padding: 8px 15px; font-size: 14px; }} 
+      .number-input, .media-type-select {{ width: 100px; font-size: 14px; }} 
+      .pagination-button {{ padding: 6px 10px; font-size: 12px; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="button-container">
+    <select id="mediaType" class="media-type-select">
+      <option value="all" selected>All ({total_items})</option>
+      <option value="images">Images ({total_type_counts['images']})</option>
+      <option value="videos">Videos ({total_type_counts['videos']})</option>
+      <option value="gifs">Gifs ({total_type_counts['gifs']})</option>
+    </select>
+    <select id="yearSelect" class="media-type-select">
+      <option value="all" selected>All ({total_items})</option>
+    </select>
+    <div id="itemsPerUserContainer">
+      <input type="number" id="itemsPerUser" class="number-input" min="1" value="2" placeholder="Items per user">
+    </div>
+    <input type="number" id="itemsPerPage" class="number-input" min="1" value="{default_items_per_page}" placeholder="Items per page">
+    <button class="filter-button active" data-usernames="" data-original-text="All">All ({total_items})</button>
+    {"".join(
+    f'<button class="filter-button" data-usernames="{html.escape(username.replace(" ", "_"))}" '
+    f'data-original-text="{html.escape(username)} ({media_counts[username]})">'
+    f'{html.escape(username)} ({media_counts[username]})</button>'
+    for username in usernames)}
+  </div>
+  <div class="pagination" id="pagination"></div>
+  <div class="masonry" id="masonry"></div>
+  <script>
+    const mediaData = {media_data_json};
+    const usernames = {orjson.dumps([username.replace(' ', '_') for username in usernames]).decode('utf-8')};
+    const yearCounts = {year_counts_json};
+    const masonry = document.getElementById("masonry");
+    const pagination = document.getElementById("pagination");
+    const buttons = document.querySelectorAll('.filter-button');
+    const mediaTypeSelect = document.getElementById('mediaType');
+    const yearSelect = document.getElementById('yearSelect');
+    yearSelect.innerHTML = '<option value="all" selected>All (' + Object.values(yearCounts).reduce((a,b)=>a+b,0) + ')</option>';
+    const sortedYears = Object.keys(yearCounts).sort((a,b)=>b-a);
+    sortedYears.forEach(year => {{
+      const option = document.createElement('option');
+      option.value = year;
+      option.textContent = year + ' (' + yearCounts[year] + ')';
+      yearSelect.appendChild(option);
+    }});
+    const itemsPerUserInput = document.getElementById('itemsPerUser');
+    const itemsPerPageInput = document.getElementById('itemsPerPage');
+    let selectedUsername = '';
+    window.currentPage = 1;
+
+    function updateButtonLabels() {{
+      buttons.forEach(button => {{
+        const originalText = button.getAttribute('data-original-text');
+        button.textContent = originalText;
+      }});
+    }}
+
+    function generateVideoThumbnail(videoElement) {{
+      videoElement.addEventListener('loadedmetadata', function handleLoadedMetadata() {{
+        try {{
+          videoElement.currentTime = 0.1;
+        }} catch (e) {{
+          console.error('Error setting currentTime:', e);
+        }}
+        videoElement.removeEventListener('loadedmetadata', handleLoadedMetadata);
+      }}, {{ once: true }});
+
+      videoElement.addEventListener('seeked', function handleSeeked() {{
+        try {{
+          const playPromise = videoElement.play();
+          if (playPromise !== undefined) {{
+            playPromise.then(() => {{
+              setTimeout(() => {{
+                videoElement.pause();
+              }}, 100);
+            }}).catch(e => {{
+              console.error('Play error:', e);
+              videoElement.pause();
+            }});
+          }} else {{
+            videoElement.play();
+            setTimeout(() => {{
+              videoElement.pause();
+            }}, 100);
+          }}
+        }} catch (e) {{
+          console.error('Error in play/pause:', e);
+        }}
+        videoElement.removeEventListener('seeked', handleSeeked);
+      }}, {{ once: true }});
+    }}
+
+    function getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, page, yearFilter) {{
+      try {{
+        let allMedia = [];
+        if (selectedUsername === '') {{
+          let maxRounds = 0;
+          const mediaByUser = {{}};
+          usernames.forEach(username => {{
+            let userMedia = mediaData[username] || [];
+            if (mediaType !== 'all') {{
+              userMedia = userMedia.filter(item => item.type === mediaType);
+            }}
+            if (yearFilter !== 'all') {{
+              userMedia = userMedia.filter(item => item.date.startsWith(yearFilter));
+            }}
+            userMedia = userMedia.sort((a, b) => new Date(b.date) - new Date(a.date));
+            mediaByUser[username] = userMedia;
+            maxRounds = Math.max(maxRounds, Math.ceil(userMedia.length / itemsPerUser));
+          }});
+          for (let round = 0; round < maxRounds; round++) {{
+            usernames.forEach(username => {{
+              const start = round * itemsPerUser;
+              const end = start + itemsPerUser;
+              allMedia = allMedia.concat(mediaByUser[username].slice(start, end));
+            }});
+          }}
+          allMedia = allMedia.filter(item => item);
+        }} else {{
+          let userMedia = mediaData[selectedUsername] || [];
+          if (mediaType !== 'all') {{
+            userMedia = userMedia.filter(item => item.type === mediaType);
+          }}
+          if (yearFilter !== 'all') {{
+            userMedia = userMedia.filter(item => item.date.startsWith(yearFilter));
+          }}
+          allMedia = userMedia.sort((a, b) => new Date(b.date) - new Date(a.date));
+        }}
+        const start = (page - 1) * itemsPerPage;
+        const end = start + itemsPerPage;
+        console.log('getOrderedMedia:', {{ mediaType, itemsPerUser, itemsPerPage, page, yearFilter, start, end, total: allMedia.length }});
+        return {{ media: allMedia.slice(start, end), total: allMedia.length }};
+      }} catch (e) {{
+        console.error('Error in getOrderedMedia:', e);
+        return {{ media: [], total: 0 }};
+      }}
+    }}
+
+    function updatePagination(totalItems, itemsPerPage, currentPage) {{
+      try {{
+        pagination.innerHTML = '';
+        const totalPages = Math.ceil(totalItems / itemsPerPage);
+        if (totalPages <= 1) {{
+          console.log('updatePagination: Only one page, no pagination needed');
+          return;
+        }}
+
+        console.log('updatePagination:', {{ totalItems, itemsPerPage, currentPage: window.currentPage, totalPages }});
+
+        const maxButtons = 5;
+        let startPage = Math.max(1, window.currentPage - Math.floor(maxButtons / 2));
+        let endPage = Math.min(totalPages, startPage + maxButtons - 1);
+        if (endPage - startPage + 1 < maxButtons) {{
+          startPage = Math.max(1, endPage - maxButtons + 1);
+        }}
+
+        const prevButton = document.createElement('button');
+        prevButton.className = 'pagination-button';
+        prevButton.textContent = 'Previous';
+        prevButton.disabled = window.currentPage === 1;
+        prevButton.addEventListener('click', () => {{
+          if (window.currentPage > 1) {{
+            window.currentPage--;
+            console.log('Previous button clicked, new currentPage:', window.currentPage);
+            renderMedia();
+          }}
+        }});
+        pagination.appendChild(prevButton);
+
+        for (let i = startPage; i <= endPage; i++) {{
+          const pageButton = document.createElement('button');
+          pageButton.className = 'pagination-button' + (i === window.currentPage ? ' active' : '');
+          pageButton.textContent = i;
+          pageButton.addEventListener('click', (function(pageNumber) {{
+            return function() {{
+              window.currentPage = pageNumber;
+              console.log('Page button clicked, new currentPage:', window.currentPage);
+              renderMedia();
+            }};
+          }})(i));
+          pagination.appendChild(pageButton);
+        }}
+
+        const nextButton = document.createElement('button');
+        nextButton.className = 'pagination-button';
+        nextButton.textContent = 'Next';
+        nextButton.disabled = window.currentPage === totalPages;
+        nextButton.addEventListener('click', () => {{
+          if (window.currentPage < totalPages) {{
+            window.currentPage++;
+            console.log('Next button clicked, new currentPage:', window.currentPage);
+            renderMedia();
+          }}
+        }});
+        pagination.appendChild(nextButton);
+      }} catch (e) {{
+        console.error('Error in updatePagination:', e);
+      }}
+    }}
+
+    function renderMedia() {{
+      try {{
+        masonry.innerHTML = '';
+        const mediaType = mediaTypeSelect.value;
+        const yearFilter = yearSelect.value;
+        const itemsPerUser = parseInt(itemsPerUserInput.value) || 2;
+        const itemsPerPage = parseInt(itemsPerPageInput.value) || {default_items_per_page};
+        const result = getOrderedMedia(mediaType, itemsPerUser, itemsPerPage, window.currentPage, yearFilter);
+        const allMedia = result.media;
+        const totalItems = result.total;
+        console.log('renderMedia:', {{ mediaType, yearFilter, itemsPerUser, itemsPerPage, currentPage: window.currentPage, mediaCount: allMedia.length, totalItems }});
+        updatePagination(totalItems, itemsPerPage, window.currentPage);
+
+        const columnsCount = 3;
+        const columns = [];
+        for (let i = 0; i < columnsCount; i++) {{
+          const col = document.createElement("div");
+          col.className = "column";
+          masonry.appendChild(col);
+          columns.push(col);
+        }}
+
+        const totalRows = Math.ceil(allMedia.length / columnsCount);
+        for (let row = 0; row < totalRows; row++) {{
+          for (let col = 0; col < columnsCount; col++) {{
+            const actualCol = row % 2 === 0 ? col : columnsCount - 1 - col;
+            const index = row * columnsCount + col;
+            if (index < allMedia.length) {{
+              let element;
+              if (allMedia[index].type === "videos") {{
+                element = document.createElement("video");
+                element.src = allMedia[index].src;
+                element.controls = true;
+                element.alt = "Video";
+                element.loading = "lazy";
+                element.preload = "metadata";
+                element.playsInline = true;
+                element.onerror = () => {{
+                  console.error('Failed to load video:', allMedia[index].src);
+                  element.remove();
+                }};
+                element.addEventListener('loadedmetadata', () => {{
+                  generateVideoThumbnail(element);
+                }}, {{ once: true }});
+              }} else {{
+                element = document.createElement("img");
+                element.src = allMedia[index].src;
+                element.alt = allMedia[index].type.charAt(0).toUpperCase() + allMedia[index].type.slice(1);
+                element.loading = "lazy";
+                element.onerror = () => {{
+                  console.error('Failed to load image:', allMedia[index].src);
+                  element.remove();
+                }};
+              }}
+              columns[actualCol].appendChild(element);
+            }}
+          }}
+        }}
+        window.scrollTo({{ top: 0, behavior: "smooth" }});
+      }} catch (e) {{
+        console.error('Error in renderMedia:', e);
+        masonry.innerHTML = '<p style="color: red;">Error loading media. Please check console for details.</p>';
+      }}
+    }}
+
+    buttons.forEach(button => {{
+      button.addEventListener('click', () => {{
+        try {{
+          const username = button.getAttribute('data-usernames');
+          if (button.classList.contains('active')) {{
+            return;
+          }}
+          buttons.forEach(btn => btn.classList.remove('active'));
+          button.classList.add('active');
+          selectedUsername = username;
+          window.currentPage = 1;
+          console.log('Filter button clicked, selectedUsername:', username, 'currentPage:', window.currentPage);
+          updateButtonLabels();
+          renderMedia();
+        }} catch (e) {{
+          console.error('Error in button click handler:', e);
+        }}
+      }});
+    }});
+
+    mediaTypeSelect.addEventListener('change', () => {{
+      try {{
+        window.currentPage = 1;
+        console.log('Media type changed, resetting currentPage to 1');
+        renderMedia();
+      }} catch (e) {{
+        console.error('Error in mediaTypeSelect change handler:', e);
+      }}
+    }});
+
+    yearSelect.addEventListener('change', () => {{
+      try {{
+        window.currentPage = 1;
+        console.log('Year changed, resetting currentPage to 1');
+        renderMedia();
+      }} catch (e) {{
+        console.error('Error in yearSelect change handler:', e);
+      }}
+    }});
+
+    itemsPerUserInput.addEventListener('input', () => {{
+      try {{
+        window.currentPage = 1;
+        console.log('Items per user changed, resetting currentPage to 1');
+        renderMedia();
+      }} catch (e) {{
+        console.error('Error in itemsPerUserInput input handler:', e);
+      }}
+    }});
+
+    itemsPerPageInput.addEventListener('input', () => {{
+      try {{
+        window.currentPage = 1;
+        console.log('Items per page changed, resetting currentPage to 1');
+        renderMedia();
+      }} catch (e) {{
+        console.error('Error in itemsPerPageInput input handler:', e);
+      }}
+    }});
+
+    document.addEventListener('play', function(e) {{
+      const videos = document.querySelectorAll("video");
+      videos.forEach(video => {{
+        if (video !== e.target) {{
+          video.pause();
+        }}
+      }});
+    }}, true);
+
+    try {{
+      updateButtonLabels();
+      renderMedia();
+    }} catch (e) {{
+      console.error('Initial render failed:', e);
+      masonry.innerHTML = '<p style="color: red;">Error loading media. Please check console for details.</p>';
+    }}
+  </script>
+</body>
+</html>"""]
+    
+
+    html_content = "".join(html_fragments)
+    logger.info(f"Generated HTML with {total_items} items, size: {len(html_content) / (1024 * 1024):.2f} MB")
+    
+    # Clean up temporary data to free memory
+    try:
+        html_fragments.clear()
+        del html_fragments
+        media_data.clear()
+        del media_data
+        media_counts.clear()
+        del media_counts
+        gc.collect()  # Force garbage collection after HTML generation
+        logger.info("Memory cleaned up after HTML generation")
+    except Exception as cleanup_error:
+        logger.error(f"Error during HTML generation cleanup: {str(cleanup_error)}")
+        gc.collect()  # Still attempt garbage collection
+    
+    return html_content
+
+# ───────────────────────────────
+# � UPLOAD FUNCTIONS
+# ───────────────────────────────
+async def upload_file(client, host, data):
+    buf = BytesIO(data)
+    files = {host["field"]:(UPLOAD_FILE, buf, "text/html")}
+    try:
+        r = await client.post(host["url"], files=files, data=host.get("data", {}), timeout=30.0)
+        if r.status_code in (200,201):
+            if host["name"]=="HTML Hosting":
+                j = r.json()
+                if j.get("success") and j.get("url"):
+                    return (host["name"], j["url"])
+                else:
+                    return (host["name"], f"Error: {j.get('error','Unknown')}")
+            else:
+                t = r.text.strip()
+                if t.startswith("https://"):
+                    if host["name"]=="Litterbox" and "files.catbox.moe" in t:
+                        t = "https://litterbox.catbox.moe/"+t.split("/")[-1]
+                    return (host["name"], t)
+                return (host["name"], f"Invalid response: {t[:100]}")
+        return (host["name"], f"HTTP {r.status_code}")
+    except Exception as e:
+        return (host["name"], f"Exception: {e}")
+
+# ───────────────────────────────
+# PROGRESS BAR
+# ───────────────────────────────
 def generate_bar(percentage):
     filled = int(percentage / 10)
     empty = 10 - filled
     return "●" * filled + "○" * (empty // 2) + "◌" * (empty - empty // 2)
 
 # ───────────────────────────────
-# 🗄️ DATABASE MANAGEMENT
+# PROCESS USER
 # ───────────────────────────────
-
-async def init_database():
-    """Initialize SQLite database with required tables"""
-    try:
-        os.makedirs(DB_DIR, exist_ok=True)
+async def process_user(user, title_only, user_idx, total_users, progress_msg, last_edit):
+    logger.info(f"Processing user: {user}")
+    
+    search_display = "+".join(user.split())
+    tokens = [t for t in re.split(r"[,\s]+", user) if t]
+    phrase = " ".join(tokens)
+    PATTERNS = []
+    if phrase:
+        PATTERNS.append(re.compile(r"\b" + re.escape(phrase) + r"\b", re.IGNORECASE))
+    for tok in tokens:
+        PATTERNS.append(re.compile(r"\b" + re.escape(tok) + r"\b", re.IGNORECASE))
+    
+    os.makedirs("Scraping", exist_ok=True)
+    
+    # Update progress: start
+    progress = (user_idx / total_users) * 100
+    bar = generate_bar(progress)
+    msg = f"completed {user_idx}/{total_users}\n{bar} {progress:.2f}%\nprocess current username: {user}"
+    now = time.time()
+    if now - last_edit[0] > 3 and msg != last_edit[1]:
+        await progress_msg.edit(msg)
+        last_edit[0] = now
+        last_edit[1] = msg
+    
+    async with aiosqlite.connect(TEMP_DB) as db:
+        await db.execute('''CREATE TABLE IF NOT EXISTS media (
+            id INTEGER PRIMARY KEY,
+            username TEXT,
+            post_date TEXT,
+            media_url TEXT UNIQUE,
+            media_type TEXT
+        )''')
+        # Create indexes for faster queries
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_username ON media(username)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_date ON media(post_date)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_type ON media(media_type)')
+        await db.commit()
         
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Table for tracking downloaded URLs
-            await db.execute('''
-                CREATE TABLE IF NOT EXISTS downloaded_urls (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    url TEXT UNIQUE NOT NULL,
-                    username TEXT,
-                    file_path TEXT,
-                    file_size INTEGER,
-                    media_type TEXT,
-                    download_timestamp INTEGER,
-                    status TEXT DEFAULT 'pending',
-                    retry_count INTEGER DEFAULT 0,
-                    error_message TEXT
-                )
-            ''')
-            
-            # Index for faster lookups
-            await db.execute('CREATE INDEX IF NOT EXISTS idx_url ON downloaded_urls(url)')
-            await db.execute('CREATE INDEX IF NOT EXISTS idx_status ON downloaded_urls(status)')
-            await db.execute('CREATE INDEX IF NOT EXISTS idx_username ON downloaded_urls(username)')
-            
-            # Table for batch tracking
-            await db.execute('''
-                CREATE TABLE IF NOT EXISTS batch_tracking (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT,
-                    batch_number INTEGER,
-                    total_urls INTEGER,
-                    downloaded INTEGER,
-                    sent INTEGER,
-                    failed INTEGER,
-                    timestamp INTEGER
-                )
-            ''')
-            
-            # Table for sent images tracking (prevent duplicate sends)
-            await db.execute('''
-                CREATE TABLE IF NOT EXISTS sent_images (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    url TEXT UNIQUE NOT NULL,
-                    chat_id INTEGER,
-                    topic_id INTEGER,
-                    username TEXT,
-                    batch_number INTEGER,
-                    sent_timestamp INTEGER
-                )
-            ''')
-            
-            await db.commit()
-            logger.info("✅ Database initialized successfully")
-            
-            # Clean up old data (optional - keep last 7 days)
-            seven_days_ago = int(time.time()) - (7 * 24 * 60 * 60)
-            await db.execute('DELETE FROM downloaded_urls WHERE download_timestamp < ?', (seven_days_ago,))
-            await db.execute('DELETE FROM batch_tracking WHERE timestamp < ?', (seven_days_ago,))
-            await db.commit()
-            
-            # Force garbage collection after DB operations
-            gc.collect()
-            
-    except Exception as e:
-        logger.error(f"❌ Database initialization error: {str(e)}")
-
-async def check_url_downloaded(url):
-    """Check if URL was already successfully downloaded"""
-    if not ENABLE_DATABASE:
-        return False
-    
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                'SELECT status FROM downloaded_urls WHERE url = ? AND status = "success"',
-                (url,)
-            ) as cursor:
-                result = await cursor.fetchone()
-                return result is not None
-    except Exception as e:
-        logger.warning(f"⚠️ Database check error for {url}: {str(e)}")
-        return False
-
-async def check_url_sent(url, chat_id):
-    """Check if URL was already sent to this chat"""
-    if not ENABLE_DATABASE:
-        return False
-    
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                'SELECT id FROM sent_images WHERE url = ? AND chat_id = ?',
-                (url, chat_id)
-            ) as cursor:
-                result = await cursor.fetchone()
-                return result is not None
-    except Exception as e:
-        logger.warning(f"⚠️ Database sent check error: {str(e)}")
-        return False
-
-async def mark_url_downloaded(url, username, file_path, file_size, media_type, status='success', error_msg=None):
-    """Mark URL as downloaded in database"""
-    if not ENABLE_DATABASE:
-        return
-    
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute('''
-                INSERT OR REPLACE INTO downloaded_urls 
-                (url, username, file_path, file_size, media_type, download_timestamp, status, error_message)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (url, username, file_path, file_size, media_type, int(time.time()), status, error_msg))
-            await db.commit()
-            
-        # Force garbage collection
-        gc.collect()
-    except Exception as e:
-        logger.warning(f"⚠️ Database insert error: {str(e)}")
-
-async def mark_url_sent(url, chat_id, topic_id, username, batch_number):
-    """Mark URL as sent in database"""
-    if not ENABLE_DATABASE:
-        return
-    
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute('''
-                INSERT OR IGNORE INTO sent_images 
-                (url, chat_id, topic_id, username, batch_number, sent_timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (url, chat_id, topic_id, username, batch_number, int(time.time())))
-            await db.commit()
-            
-        # Force garbage collection
-        gc.collect()
-    except Exception as e:
-        logger.warning(f"⚠️ Database sent tracking error: {str(e)}")
-
-async def save_batch_stats(session_id, batch_number, total_urls, downloaded, sent, failed):
-    """Save batch statistics to database"""
-    if not ENABLE_DATABASE:
-        return
-    
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute('''
-                INSERT INTO batch_tracking 
-                (session_id, batch_number, total_urls, downloaded, sent, failed, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (session_id, batch_number, total_urls, downloaded, sent, failed, int(time.time())))
-            await db.commit()
-            
-        # Force garbage collection
-        gc.collect()
-    except Exception as e:
-        logger.warning(f"⚠️ Batch stats save error: {str(e)}")
-
-async def get_failed_urls_from_db(session_id=None, limit=100):
-    """Get failed URLs from database for retry"""
-    if not ENABLE_DATABASE:
-        return []
-    
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            query = '''
-                SELECT url, username, retry_count 
-                FROM downloaded_urls 
-                WHERE status = "failed" AND retry_count < ?
-                ORDER BY retry_count ASC, download_timestamp DESC
-                LIMIT ?
-            '''
-            async with db.execute(query, (MAX_DOWNLOAD_RETRIES, limit)) as cursor:
-                results = await cursor.fetchall()
+        start_url = build_search_url(INITIAL_SEARCH_ID, search_display, NEWER_THAN, OLDER_THAN, title_only=title_only)
+        batch_num = 1
+        current_url = start_url
+        
+        # Optimized HTTP client with connection pooling
+        limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
+        async with httpx.AsyncClient(limits=limits) as client:
+            while current_url:
+                resp = await fetch_page(client, current_url)
+                if not resp["ok"]:
+                    logger.error(f"Failed batch start URL {current_url}")
+                    break
                 
-        # Force garbage collection
-        gc.collect()
-        return results
-    except Exception as e:
-        logger.warning(f"⚠️ Failed URLs retrieval error: {str(e)}")
-        return []
-
-async def cleanup_database():
-    """Clean up database and optimize"""
-    if not ENABLE_DATABASE:
-        return
-    
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Vacuum to reclaim space
-            await db.execute('VACUUM')
-            await db.commit()
-            logger.info("✅ Database optimized")
-            
-        # Force garbage collection
-        gc.collect()
-    except Exception as e:
-        logger.warning(f"⚠️ Database cleanup error: {str(e)}")
-
-# ───────────────────────────────
-# 📹 VIDEO & GIF CONVERSION
-# ───────────────────────────────
-
-def is_gif_url(url):
-    """Check if URL is a GIF that should be converted to thumbnail"""
-    url_lower = url.lower()
-    for ext in GIF_EXTS:
-        if f'.{ext}' in url_lower:
-            logger.debug(f"🎬 GIF URL detected: {url}")
-            return True
-    return False
-
-def is_video_url(url):
-    """Check if URL is a video that should be converted to thumbnail"""
-    # First, check excluded video prefixes (URLs that look like videos but don't work)
-    for excluded_prefix in EXCLUDED_VIDEO_PREFIXES:
-        if url.startswith(excluded_prefix):
-            logger.debug(f"⚠️ Excluding video URL (matches excluded prefix): {url}")
-            return False
-    
-    # Check if URL starts with EXACT special video domain prefix
-    if url.startswith(VIDEO_DOMAIN_PREFIX):
-        logger.debug(f"✅ Video URL detected (matches VIDEO_DOMAIN_PREFIX): {url}")
-        return True
-    
-    # Check for video extensions in URL
-    url_lower = url.lower()
-    for ext in VIDEO_EXTS:
-        if f'.{ext}' in url_lower:
-            logger.debug(f"🎥 Video URL detected (extension): {url}")
-            return True
-    
-    return False
-
-def convert_gif_to_thumbnail(filepath):
-    """Convert GIF to static thumbnail (first frame) as JPEG - preserving original quality"""
-    try:
-        logger.info(f"🎬 Converting GIF to thumbnail: {filepath}")
-        with Image.open(filepath) as gif:
-            # Get first frame
-            gif.seek(0)
-            frame = gif.convert("RGB")
-            
-            # Create new filepath with correct extension
-            new_filepath = filepath.rsplit('.', 1)[0] + CONVERT_TO_EXTENSION
-            
-            # Save with maximum quality - no compression or optimization
-            if PRESERVE_ORIGINAL_QUALITY:
-                frame.save(new_filepath, 'JPEG', quality=100, subsampling=0)
-            else:
-                frame.save(new_filepath, 'JPEG', quality=95, optimize=True)
-            
-        # Remove original GIF file immediately
-        if os.path.exists(filepath):
-            os.remove(filepath)
-        
-        # Force garbage collection to free memory immediately
-        del frame
-        gc.collect()
-        
-        new_size = os.path.getsize(new_filepath)
-        logger.info(f"✅ GIF converted to thumbnail: {new_size} bytes → {new_filepath}")
-        return new_filepath
-    except Exception as e:
-        logger.error(f"❌ GIF conversion failed for {filepath}: {str(e)}")
-        # Clean up on error
-        try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-        except:
-            pass
-        return None
-
-def convert_video_to_thumbnail(filepath):
-    """Convert video to thumbnail (first frame) as JPG - preserving original quality"""
-    try:
-        logger.info(f"🎥 Converting video to thumbnail: {filepath}")
-        
-        # Read first frame from video file
-        frame = iio.imread(filepath, index=0)
-        
-        # Create new filepath with correct extension
-        new_filepath = filepath.rsplit('.', 1)[0] + CONVERT_TO_EXTENSION
-        
-        # Save with maximum quality - no compression
-        if PRESERVE_ORIGINAL_QUALITY:
-            iio.imwrite(new_filepath, frame, quality=100)
-        else:
-            iio.imwrite(new_filepath, frame, quality=95)
-        
-        # Clear frame from memory
-        del frame
-        
-        # Remove original video file immediately
-        if os.path.exists(filepath):
-            os.remove(filepath)
-        
-        # Force garbage collection
-        gc.collect()
-        
-        new_size = os.path.getsize(new_filepath)
-        logger.info(f"✅ Video converted to thumbnail: {new_size} bytes → {new_filepath}")
-        return new_filepath
-    except Exception as e:
-        logger.error(f"❌ Video conversion failed for {filepath}: {str(e)}")
-        # Clean up on error
-        try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-        except:
-            pass
-        return None
-
-def normalize_image_extension(filepath):
-    """Convert any image to consistent extension (.jpg) - preserving original quality"""
-    try:
-        if filepath.lower().endswith(CONVERT_TO_EXTENSION):
-            return filepath  # Already correct extension
-        
-        logger.info(f"🔄 Normalizing image extension: {filepath}")
-        with Image.open(filepath) as img:
-            # Convert to RGB if necessary
-            if img.mode in ('RGBA', 'LA', 'P'):
-                img = img.convert('RGB')
-            
-            # Create new filepath with correct extension
-            new_filepath = filepath.rsplit('.', 1)[0] + CONVERT_TO_EXTENSION
-            
-            # Save with maximum quality - no compression or optimization
-            if PRESERVE_ORIGINAL_QUALITY:
-                img.save(new_filepath, 'JPEG', quality=100, subsampling=0)
-            else:
-                img.save(new_filepath, 'JPEG', quality=95, optimize=True)
-        
-        # Remove original file
-        if os.path.exists(filepath) and filepath != new_filepath:
-            os.remove(filepath)
-        
-        gc.collect()
-        logger.info(f"✅ Extension normalized: {new_filepath}")
-        return new_filepath
-    except Exception as e:
-        logger.error(f"❌ Extension normalization failed for {filepath}: {str(e)}")
-        return filepath  # Return original on error
-
-# ───────────────────────────────
-# 🧩 UTILITIES
-# ───────────────────────────────
-
-# Global aiohttp session (reuse connections for speed)
-_aiohttp_session = None
-
-async def get_aiohttp_session():
-    """Get or create global aiohttp session with optimized settings"""
-    global _aiohttp_session
-    if _aiohttp_session is None or _aiohttp_session.closed:
-        timeout = aiohttp.ClientTimeout(
-            total=TOTAL_TIMEOUT,
-            connect=CONNECT_TIMEOUT,
-            sock_read=SOCK_READ_TIMEOUT
-        )
-        connector = aiohttp.TCPConnector(
-            limit=TCP_CONNECTOR_LIMIT,
-            limit_per_host=TCP_CONNECTOR_LIMIT_PER_HOST,
-            ttl_dns_cache=300,
-            enable_cleanup_closed=True
-        )
-        _aiohttp_session = aiohttp.ClientSession(
-            timeout=timeout,
-            connector=connector,
-            raise_for_status=False
-        )
-        logger.info("✅ Created optimized aiohttp session")
-    return _aiohttp_session
-
-async def fetch_html(url: str):
-    try:
-        session = await get_aiohttp_session()
-        logger.debug(f"🌐 Fetching HTML from: {url}")
-        async with session.get(url, allow_redirects=True) as response:
-            if response.status == 200:
-                text = await response.text()
-                logger.debug(f"✅ HTML fetched successfully ({len(text)} chars)")
-                return text
-            else:
-                logger.warning(f"⚠️ HTTP {response.status} for HTML fetch: {url}")
-                return ""
-    except asyncio.TimeoutError:
-        logger.error(f"⏱️ Timeout fetching HTML from {url}")
-        return ""
-    except Exception as e:
-        logger.error(f"❌ Fetch error for {url}: {e}")
-        return ""
-
-def extract_media_data_from_html(html_str: str):
-    """Extract mediaData, usernames, yearCounts from HTML"""
-    try:
-        tree = HTMLParser(html_str)
-        script_tags = tree.css("script")
-        media_data = {}
-        usernames = []
-        year_counts = {}
-
-        for script in script_tags:
-            script_text = script.text()
-            if "const mediaData =" in script_text:
-                # Extract mediaData JSON
-                match = re.search(r'const mediaData = (\{.*?\});', script_text, re.DOTALL)
-                if match:
-                    media_data = json.loads(match.group(1))
-            if "const usernames =" in script_text:
-                # Extract usernames JSON
-                match = re.search(r'const usernames = (\[.*?\]);', script_text, re.DOTALL)
-                if match:
-                    usernames = json.loads(match.group(1))
-            if "const yearCounts =" in script_text:
-                # Extract yearCounts JSON
-                match = re.search(r'const yearCounts = (\{.*?\});', script_text, re.DOTALL)
-                if match:
-                    year_counts = json.loads(match.group(1))
-
-        return media_data, usernames, year_counts
-    except Exception as e:
-        logger.error(f"Error extracting media data: {str(e)}")
-        return {}, [], {}
-
-def create_username_images(media_data, usernames):
-    """Create username_images dict from mediaData"""
-    username_images = {}
-    for username in usernames:
-        safe_username = username.replace(' ', '_')
-        if safe_username in media_data:
-            urls = [item['src'] for item in media_data[safe_username]]
-            username_images[username] = urls
-    return username_images
-
-def filter_and_deduplicate_urls(username_images):
-    """Filter URLs, exclude domains, remove duplicates, categorize media types"""
-    all_urls = []
-    seen_urls = set()
-    filtered_username_images = {}
-    media_stats = {'images': 0, 'gifs': 0, 'videos': 0, 'excluded': 0}
-
-    for username, urls in username_images.items():
-        filtered_urls = []
-        for url in urls:
-            if not url or not url.startswith(('http://', 'https://')):
-                continue
-            
-            # Skip duplicates
-            if url in seen_urls:
-                continue
-            
-            # Exclude specific domains
-            if any(domain in url.lower() for domain in EXCLUDED_DOMAINS):
-                media_stats['excluded'] += 1
-                continue
-            
-            # Check if it's a video
-            if is_video_url(url):
-                if ENABLE_VIDEO_CONVERSION:
-                    seen_urls.add(url)
-                    all_urls.append(url)
-                    filtered_urls.append(url)
-                    media_stats['videos'] += 1
-                else:
-                    media_stats['excluded'] += 1
-                continue
-            
-            # Check if it's a GIF
-            if is_gif_url(url):
-                if ENABLE_GIF_CONVERSION:
-                    seen_urls.add(url)
-                    all_urls.append(url)
-                    filtered_urls.append(url)
-                    media_stats['gifs'] += 1
-                else:
-                    media_stats['excluded'] += 1
-                continue
-            
-            # Check if it's a valid image
-            url_lower = url.lower()
-            has_image_ext = any(f".{ext}" in url_lower for ext in VALID_IMAGE_EXTS)
-            
-            if has_image_ext:
-                seen_urls.add(url)
-                all_urls.append(url)
-                filtered_urls.append(url)
-                media_stats['images'] += 1
-        
-        if filtered_urls:
-            filtered_username_images[username] = filtered_urls
-    
-    logger.info(f"📊 Media filtered - Images: {media_stats['images']}, GIFs: {media_stats['gifs']}, "
-                f"Videos: {media_stats['videos']}, Excluded: {media_stats['excluded']}")
-    
-    # Clear seen_urls set to free memory
-    seen_urls.clear()
-    gc.collect()
-
-    return filtered_username_images, all_urls
-
-async def download_image(url, temp_dir, semaphore, url_metadata=None):
-    """Download single image/video/gif with retries and conversion using aiohttp"""
-    async with semaphore:
-        await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
-        
-        # Check if already downloaded in database
-        if ENABLE_DATABASE and await check_url_downloaded(url):
-            logger.debug(f"ℹ️ URL already downloaded (from DB): {url}")
-            return None
-        
-        username = url_metadata.get('username') if url_metadata else 'Unknown'
-        media_type = 'image'
-        if is_video_url(url):
-            media_type = 'video'
-        elif is_gif_url(url):
-            media_type = 'gif'
-        
-        session = await get_aiohttp_session()
-        
-        for attempt in range(MAX_DOWNLOAD_RETRIES):
-            current_retry_delay = RETRY_DELAY[min(attempt, len(RETRY_DELAY) - 1)]
-            
-            try:
-                logger.debug(f"🔽 Downloading (attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES}): {url}")
-                start_time = time.time()
+                search_id = extract_search_id(resp["final_url"]) or INITIAL_SEARCH_ID
+                total_pages = get_total_pages(resp["html"])
+                logger.info(f"Batch {batch_num}: {total_pages} pages, search_id {search_id}")
                 
-                async with session.get(url, allow_redirects=True) as response:
-                    download_time = time.time() - start_time
+                for page_num in range(1, total_pages + 1):
+                    match = re.search(r"c\[older_than]=(\d+)", current_url)
+                    older_than_ts = match.group(1) if match else None
+                    page_url = build_search_url(search_id, search_display, NEWER_THAN, OLDER_THAN, page_num, 
+                                               None if batch_num == 1 else older_than_ts, title_only)
+                    result = await fetch_page(client, page_url)
+                    if not result["ok"]:
+                        logger.error(f"Failed page {page_num}")
+                        continue
                     
-                    if response.status == 200:
-                        content = await response.read()
-                        content_size = len(content)
-                        logger.debug(f"⬇️ Downloaded {content_size} bytes in {download_time:.2f}s from: {url}")
-                        
-                        if content_size < MIN_IMAGE_SIZE:
-                            logger.warning(f"⚠️ Content too small ({content_size} bytes): {url}")
-                            if ENABLE_DATABASE:
-                                await mark_url_downloaded(url, username, None, content_size, media_type, 
-                                                        status='failed', error_msg='Content too small')
-                            return None
-                        
-                        # Determine file extension from URL or content-type
-                        file_ext = '.jpg'  # default
-                        if is_video_url(url):
-                            # Detect video extension
-                            for ext in VIDEO_EXTS:
-                                if f'.{ext}' in url.lower():
-                                    file_ext = f'.{ext}'
-                                    break
-                        elif is_gif_url(url):
-                            file_ext = '.gif'
-                        else:
-                            # Try to get extension from URL
-                            for ext in VALID_IMAGE_EXTS:
-                                if f'.{ext}' in url.lower():
-                                    file_ext = f'.{ext}'
-                                    break
-                        
-                        # Save to temp file
-                        filename = f"temp_{int(time.time() * 1000000)}_{content_size}{file_ext}"
-                        filepath = os.path.join(temp_dir, filename)
-                        
-                        with open(filepath, 'wb') as f:
-                            f.write(content)
-                        
-                        logger.debug(f"💾 Saved to: {filepath}")
-                        
-                        # Clear content from memory immediately
-                        del content
-                        gc.collect()
-                        
-                        # Convert if needed
-                        if is_video_url(url) and ENABLE_VIDEO_CONVERSION:
-                            converted_path = convert_video_to_thumbnail(filepath)
-                            if converted_path:
-                                filepath = converted_path
+                    threads = extract_threads(result["html"])
+                    if not threads:
+                        continue
+                    
+                    # Process articles
+                    articles = await process_threads_concurrent(threads, PATTERNS)
+                    
+                    # Extract media and insert into DB
+                    for article in articles:
+                        html_data = article.get("article_html", "")
+                        media_urls = extract_media_from_html(html_data)
+                        media_urls = filter_media(media_urls, set())  # local dedup per page
+                        for url in media_urls:
+                            # Clean URL before storing
+                            url = url.strip()
+                            if url.startswith('%22') and url.endswith('%22'):
+                                url = url[3:-3]
+                            if url.startswith('"') and url.endswith('"'):
+                                url = url[1:-1]
+                            
+                            if not url.startswith(('http://', 'https://')):
+                                continue
+                            
+                            if 'vh/dl?url' in url:
+                                typ = 'videos'
+                            elif 'vh/dli?' in url:
+                                typ = 'images'
                             else:
-                                if ENABLE_DATABASE:
-                                    await mark_url_downloaded(url, username, None, 0, media_type, 
-                                                            status='failed', error_msg='Video conversion failed')
-                                return None  # Conversion failed
-                        elif is_gif_url(url) and ENABLE_GIF_CONVERSION:
-                            converted_path = convert_gif_to_thumbnail(filepath)
-                            if converted_path:
-                                filepath = converted_path
-                            else:
-                                if ENABLE_DATABASE:
-                                    await mark_url_downloaded(url, username, None, 0, media_type, 
-                                                            status='failed', error_msg='GIF conversion failed')
-                                return None  # Conversion failed
-                        else:
-                            # Normalize extension for regular images
-                            filepath = normalize_image_extension(filepath)
-                        
-                        # Verify file exists and has content
-                        if not os.path.exists(filepath):
-                            logger.error(f"❌ File disappeared after processing: {filepath}")
-                            if ENABLE_DATABASE:
-                                await mark_url_downloaded(url, username, None, 0, media_type, 
-                                                        status='failed', error_msg='File disappeared after processing')
-                            return None
-                        
-                        final_size = os.path.getsize(filepath)
-                        logger.info(f"✅ Downloaded & processed ({final_size} bytes, {download_time:.2f}s): {url}")
-                        
-                        # Mark as successfully downloaded in database
-                        if ENABLE_DATABASE:
-                            await mark_url_downloaded(url, username, filepath, final_size, media_type, status='success')
-                        
-                        result = {
-                            'url': url,
-                            'path': filepath,
-                            'size': final_size,
-                            'username': username
-                        }
-                        
-                        return result
-                    
-                    elif response.status == 404:
-                        logger.info(f"ℹ️ 404 Not Found: {url}")
-                        if ENABLE_DATABASE:
-                            await mark_url_downloaded(url, username, None, 0, media_type, 
-                                                    status='failed', error_msg='404 Not Found')
-                        return None  # Not retryable
-                    else:
-                        wait_msg = f" (waiting {current_retry_delay}s before retry)" if attempt < MAX_DOWNLOAD_RETRIES - 1 else ""
-                        logger.warning(f"⚠️ HTTP {response.status} for {url} (attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES}){wait_msg}")
-                
-            except asyncio.TimeoutError:
-                elapsed = time.time() - start_time
-                wait_msg = f" → Waiting {current_retry_delay}s before retry" if attempt < MAX_DOWNLOAD_RETRIES - 1 else ""
-                logger.warning(f"⏱️ Timeout after {elapsed:.1f}s for {url} (attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES}){wait_msg}")
-            except aiohttp.ClientError as e:
-                wait_msg = f" → Waiting {current_retry_delay}s" if attempt < MAX_DOWNLOAD_RETRIES - 1 else ""
-                logger.warning(f"⚠️ Network error for {url} (attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES}): {type(e).__name__}{wait_msg}")
-            except Exception as e:
-                wait_msg = f" → Waiting {current_retry_delay}s" if attempt < MAX_DOWNLOAD_RETRIES - 1 else ""
-                logger.warning(f"⚠️ Download error for {url} (attempt {attempt + 1}/{MAX_DOWNLOAD_RETRIES}): {str(e)}{wait_msg}")
-            
-            # Wait before retry (except on last attempt)
-            if attempt < MAX_DOWNLOAD_RETRIES - 1:
-                logger.debug(f"⏳ Sleeping {current_retry_delay}s before retry...")
-                await asyncio.sleep(current_retry_delay)
-        
-        logger.error(f"❌ PERMANENT FAILURE after {MAX_DOWNLOAD_RETRIES} attempts: {url}")
-        
-        # Mark as failed in database
-        if ENABLE_DATABASE:
-            await mark_url_downloaded(url, username, None, 0, media_type, 
-                                    status='failed', error_msg=f'Failed after {MAX_DOWNLOAD_RETRIES} attempts')
-        
-        return None
-
-async def download_batch(urls, temp_dir, username_map=None):
-    """Download batch of URLs concurrently with metadata"""
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-    
-    # Create metadata for each URL
-    tasks = []
-    for url in urls:
-        metadata = {'username': username_map.get(url) if username_map else None}
-        tasks.append(download_image(url, temp_dir, semaphore, url_metadata=metadata))
-    
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    successful = []
-    failed = []
-    
-    for url, result in zip(urls, results):
-        if isinstance(result, Exception):
-            logger.error(f"❌ Exception during download of {url}: {str(result)}")
-            failed.append(url)
-        elif result is not None:
-            successful.append(result)
-        else:
-            failed.append(url)
-    
-    return successful, failed
-
-async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, batch_num=1):
-    """Send exactly 10 images using Pyrogram with proper error handling"""
-    if not images or len(images) != BATCH_SEND_SIZE:
-        logger.warning(f"⚠️ Attempted to send {len(images)} images, expected {BATCH_SEND_SIZE}")
-        return False
-    
-    # Check if already sent in database
-    if ENABLE_DATABASE:
-        already_sent = []
-        for img in images:
-            if await check_url_sent(img['url'], chat_id):
-                already_sent.append(img['url'])
-        
-        if already_sent:
-            logger.info(f"ℹ️ {len(already_sent)} images already sent to this chat, skipping")
-            if len(already_sent) == len(images):
-                return True  # All already sent, consider it success
-    
-    async with SEND_SEMAPHORE:
-        await asyncio.sleep(SEND_DELAY)  # Rate limit protection
-        
-        max_send_retries = 3
-        for attempt in range(max_send_retries):
-            try:
-                media = []
-                for i, img in enumerate(images):
-                    if i == 0:
-                        caption = f"{username.replace('_', ' ')} - {batch_num}"
-                        media.append(InputMediaPhoto(img['path'], caption=caption))
-                    else:
-                        media.append(InputMediaPhoto(img['path']))
-                
-                if topic_id:
-                    await bot.send_media_group(chat_id, media, reply_to_message_id=topic_id)
-                else:
-                    await bot.send_media_group(chat_id, media)
-                
-                logger.info(f"✅ Sent batch {batch_num} for {username} ({len(images)} images)")
-                
-                # Mark images as sent in database
-                if ENABLE_DATABASE:
-                    for img in images:
-                        await mark_url_sent(img['url'], chat_id, topic_id, username, batch_num)
-                
-                return True
-                
-            except FloodWait as e:
-                wait_time = e.value + 2  # Add buffer
-                logger.warning(f"⏳ FloodWait: waiting {wait_time}s for {username} batch {batch_num}")
-                await asyncio.sleep(wait_time)
-                # Retry after wait
-                continue
-                
-            except Exception as e:
-                logger.error(f"❌ Send error for {username} batch {batch_num} (attempt {attempt + 1}/{max_send_retries}): {str(e)}")
-                if attempt < max_send_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
-                else:
-                    return False
-        
-        return False
-
-def cleanup_images(images):
-    """Remove temp image files and clear from memory"""
-    if not images:
-        return
-    
-    files_deleted = 0
-    for img in images:
-        try:
-            if isinstance(img, dict) and 'path' in img:
-                if os.path.exists(img['path']):
-                    os.remove(img['path'])
-                    files_deleted += 1
-        except Exception as e:
-            logger.warning(f"⚠️ Cleanup error for {img.get('path', 'unknown')}: {str(e)}")
-    
-    # Clear references and force garbage collection
-    images.clear()
-    gc.collect()
-    
-    # Log memory after cleanup
-    logger.info(f"🧹 Cleaned up {files_deleted} image files")
-    log_memory()
-
-async def process_batches(username_images, chat_id, topic_id=None, user_topic_ids=None, progress_msg=None):
-    """
-    Process all URLs with improved batching logic:
-    - Download in batches of BATCH_DOWNLOAD_SIZE
-    - Accumulate BATCH_SEND_SIZE (10) before sending
-    - Track pending sends accurately
-    - Handle failed URLs separately without infinite loops
-    - Proper cleanup and memory management
-    - Database tracking for deduplication
-    """
-    
-    # Generate unique session ID for this run
-    session_id = f"session_{int(time.time())}"
-    
-    # Initialize database
-    if ENABLE_DATABASE:
-        await init_database()
-    
-    # Create URL to username mapping
-    url_to_username = {}
-    all_urls = []
-    for username, urls in username_images.items():
-        for url in urls:
-            url_to_username[url] = username
-            all_urls.append(url)
-    
-    total_urls = len(all_urls)
-    logger.info(f"📊 Processing {total_urls} total URLs for {len(username_images)} users")
-    
-    # Stats tracking
-    stats = {
-        'total_urls': total_urls,
-        'downloaded': 0,
-        'sent': 0,
-        'failed': 0,
-        'batch_num': 0,
-        'round': 1,
-        'pending_send': 0,
-        'retry_queue': 0
-    }
-    
-    # Storage for pending images per username
-    pending_images_by_user = {username: [] for username in username_images.keys()}
-    user_batch_nums = {username: 1 for username in username_images.keys()}
-    
-    # Failed URL tracking
-    failed_urls = []
-    failed_urls_seen = set()  # Prevent infinite retry loops
-    
-    temp_dir = TEMP_DIR
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    # Progress tracking
-    last_progress_update = [0]
-    last_progress_percent = [0]
-    
-    async def update_progress():
-        """Update progress message with current stats"""
-        now = time.time()
-        progress_percent = int((stats['downloaded'] + stats['failed']) / total_urls * 100) if total_urls else 100
-        
-        # Check if enough time passed and percentage changed enough
-        time_ok = (now - last_progress_update[0]) >= PROGRESS_UPDATE_DELAY
-        percent_ok = (progress_percent - last_progress_percent[0]) >= PROGRESS_PERCENT_THRESHOLD
-        
-        if time_ok and percent_ok and progress_msg:
-            bar = generate_bar(progress_percent)
-            
-            # Count total users being processed
-            total_users = len(username_images)
-            current_user_idx = min(stats['batch_num'] // 10 + 1, total_users)
-            
-            progress_text = (
-                f"👤 User: Processing ({current_user_idx}/{total_users})\n"
-                f"{bar} {progress_percent}%\n"
-                f"📦 Batch: {stats['batch_num']} | Round: {stats['round']}\n"
-                f"📥 Downloaded: {stats['downloaded']}\n"
-                f"📤 Sent: {stats['sent']}\n"
-                f"💾 Pending Send: {stats['pending_send']}\n"
-                f"❌ Failed: {stats['failed']}\n"
-                f"🔄 Retry Queue: {stats['retry_queue']}"
-            )
-            
-            try:
-                await progress_msg.edit(progress_text)
-                last_progress_update[0] = now
-                last_progress_percent[0] = progress_percent
-            except FloodWait as e:
-                logger.warning(f"⏳ FloodWait on progress update: {e.value}s")
-                await asyncio.sleep(e.value)
-                try:
-                    await progress_msg.edit(progress_text)
-                    last_progress_update[0] = now
-                    last_progress_percent[0] = progress_percent
-                except:
-                    pass
-            except Exception as e:
-                logger.warning(f"⚠️ Progress update error: {str(e)}")
-    
-    async def send_accumulated_batches():
-        """Send all accumulated batches of 10 images"""
-        sent_count = 0
-        for username, images in list(pending_images_by_user.items()):
-            while len(images) >= BATCH_SEND_SIZE:
-                # Take exactly 10 images
-                batch_to_send = images[:BATCH_SEND_SIZE]
-                images[:BATCH_SEND_SIZE] = []  # Remove from pending
-                
-                # Get topic for this user
-                user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
-                batch_num = user_batch_nums[username]
-                
-                # Send the batch
-                success = await send_image_batch_pyrogram(
-                    batch_to_send, username, chat_id, user_topic, batch_num
-                )
-                
-                if success:
-                    stats['sent'] += len(batch_to_send)
-                    sent_count += len(batch_to_send)
-                    user_batch_nums[username] += 1
-                    logger.info(f"✅ Successfully sent and cleaning up batch {batch_num} for {username}")
-                    
-                    # Cleanup sent images (includes memory logging)
-                    cleanup_images(batch_to_send)
-                else:
-                    logger.error(f"❌ Failed to send batch {batch_num} for {username}")
-                    # Don't re-add to pending, just cleanup
-                    cleanup_images(batch_to_send)
-                
-                # Update pending count
-                stats['pending_send'] = sum(len(imgs) for imgs in pending_images_by_user.values())
-        
-        return sent_count
-    
-    # ═══════════════════════════════════════════
-    # PHASE 1: Process all original URLs
-    # ═══════════════════════════════════════════
-    logger.info("🚀 Phase 1: Processing original URLs")
-    
-    url_index = 0
-    while url_index < len(all_urls):
-        # Download batch
-        batch_urls = all_urls[url_index:url_index + BATCH_DOWNLOAD_SIZE]
-        url_index += BATCH_DOWNLOAD_SIZE
-        stats['batch_num'] += 1
-        
-        logger.info(f"📦 Downloading batch {stats['batch_num']} ({len(batch_urls)} URLs)")
-        successful, failed = await download_batch(batch_urls, temp_dir, url_to_username)
-        
-        # Track failed URLs for retry (only if not seen before)
-        for failed_url in failed:
-            if failed_url not in failed_urls_seen:
-                failed_urls.append(failed_url)
-                failed_urls_seen.add(failed_url)
-        
-        stats['failed'] += len(failed)
-        stats['retry_queue'] = len(failed_urls)
-        
-        # Add successful downloads to pending by username
-        for img_data in successful:
-            username = img_data.get('username') or url_to_username.get(img_data['url'], 'Unknown')
-            if username in pending_images_by_user:
-                pending_images_by_user[username].append(img_data)
-        
-        stats['downloaded'] += len(successful)
-        stats['pending_send'] = sum(len(imgs) for imgs in pending_images_by_user.values())
-        
-        # Send accumulated batches if we have enough
-        await send_accumulated_batches()
-        stats['pending_send'] = sum(len(imgs) for imgs in pending_images_by_user.values())
-        
-        # Update progress
-        await update_progress()
-        
-        # Memory cleanup
-        del successful, failed, batch_urls
-        gc.collect()
-        
-        # Save batch stats to database
-        if ENABLE_DATABASE:
-            await save_batch_stats(session_id, stats['batch_num'], len(batch_urls) if 'batch_urls' in locals() else 0, 
-                                  stats['downloaded'], stats['sent'], stats['failed'])
-    
-    # ═══════════════════════════════════════════
-    # PHASE 2: Retry failed URLs ONCE
-    # ═══════════════════════════════════════════
-    if failed_urls:
-        logger.info(f"🔄 Phase 2: Retrying {len(failed_urls)} failed URLs")
-        stats['round'] = 2
-        
-        retry_index = 0
-        retry_failed = []  # Don't retry these again
-        
-        while retry_index < len(failed_urls):
-            batch_urls = failed_urls[retry_index:retry_index + BATCH_DOWNLOAD_SIZE]
-            retry_index += BATCH_DOWNLOAD_SIZE
-            stats['batch_num'] += 1
-            
-            logger.info(f"🔁 Retry batch {stats['batch_num']} ({len(batch_urls)} URLs)")
-            successful, failed = await download_batch(batch_urls, temp_dir, url_to_username)
-            
-            # DO NOT retry failed URLs again (avoid infinite loop)
-            retry_failed.extend(failed)
-            
-            # Add successful to pending
-            for img_data in successful:
-                username = img_data.get('username') or url_to_username.get(img_data['url'], 'Unknown')
-                if username in pending_images_by_user:
-                    pending_images_by_user[username].append(img_data)
-            
-            stats['downloaded'] += len(successful)
-            stats['failed'] = len(failed_urls_seen) - stats['downloaded']  # Accurate failed count
-            stats['retry_queue'] = len(failed_urls) - retry_index
-            stats['pending_send'] = sum(len(imgs) for imgs in pending_images_by_user.values())
-            
-            # Send accumulated batches
-            await send_accumulated_batches()
-            stats['pending_send'] = sum(len(imgs) for imgs in pending_images_by_user.values())
-            
-            await update_progress()
-            
-            del successful, failed, batch_urls
-            gc.collect()
-        
-        # Final failed count
-        stats['failed'] = len(retry_failed)
-        stats['retry_queue'] = 0
-        logger.info(f"📊 Retry complete - {len(retry_failed)} URLs permanently failed")
-    
-    # ═══════════════════════════════════════════
-    # PHASE 3: Send remaining images (< 10)
-    # ═══════════════════════════════════════════
-    logger.info("📤 Phase 3: Sending remaining images")
-    
-    for username, images in pending_images_by_user.items():
-        if images:
-            logger.info(f"📨 Sending final {len(images)} images for {username}")
-            
-            # Send in groups of 10 if possible
-            while len(images) >= BATCH_SEND_SIZE:
-                batch_to_send = images[:BATCH_SEND_SIZE]
-                images[:BATCH_SEND_SIZE] = []
-                
-                user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
-                batch_num = user_batch_nums[username]
-                
-                success = await send_image_batch_pyrogram(
-                    batch_to_send, username, chat_id, user_topic, batch_num
-                )
-                
-                if success:
-                    stats['sent'] += len(batch_to_send)
-                    user_batch_nums[username] += 1
-                    logger.info(f"✅ Phase 3: Successfully sent batch for {username}")
-                
-                # Cleanup (includes memory logging)
-                cleanup_images(batch_to_send)
-            
-            # Send remaining (< 10) at the end
-            if images:
-                logger.info(f"📨 Sending final incomplete batch for {username}: {len(images)} images")
-                user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
-                
-                # Pad to 10 or send as-is (Telegram allows 2-10 in media group)
-                if len(images) >= 2:
-                    try:
-                        async with SEND_SEMAPHORE:
-                            await asyncio.sleep(SEND_DELAY)
-                            media = []
-                            batch_num = user_batch_nums[username]
-                            for i, img in enumerate(images):
-                                if i == 0:
-                                    caption = f"{username.replace('_', ' ')} - {batch_num} (final)"
-                                    media.append(InputMediaPhoto(img['path'], caption=caption))
+                                if '.mp4' in url.lower():
+                                    typ = 'videos'
+                                elif '.gif' in url.lower():
+                                    typ = 'gifs'
                                 else:
-                                    media.append(InputMediaPhoto(img['path']))
-                            
-                            if user_topic:
-                                await bot.send_media_group(chat_id, media, reply_to_message_id=user_topic)
-                            else:
-                                await bot.send_media_group(chat_id, media)
-                            
-                            stats['sent'] += len(images)
-                            logger.info(f"✅ Sent final incomplete batch for {username}")
-                    except Exception as e:
-                        logger.error(f"❌ Failed to send final batch for {username}: {str(e)}")
+                                    typ = 'images'
+                            await db.execute('INSERT OR IGNORE INTO media (username, post_date, media_url, media_type) VALUES (?, ?, ?, ?)', 
+                                           (user, article['post_date'], url, typ))
+                    
+                    await db.commit()  # Commit after each page
+                    
+                    # Clear memory
+                    del threads, articles
+                    gc.collect()
+                    log_memory()
+                    await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
                 
-                # Cleanup final batch (includes memory logging)
-                cleanup_images(images)
+                # Next batch
+                next_url = find_view_older_link(result["html"], title_only)
+                if not next_url:
+                    break
+                current_url = next_url
+                batch_num += 1
     
-    stats['pending_send'] = 0
-    
-    # ═══════════════════════════════════════════
-    # CLEANUP
-    # ═══════════════════════════════════════════
-    logger.info("🧹 Cleaning up temporary directory")
-    try:
-        if os.path.exists(temp_dir):
-            await aioshutil.rmtree(temp_dir)
-    except Exception as e:
-        logger.warning(f"⚠️ Cleanup error: {str(e)}")
-    
-    # Optimize database
-    if ENABLE_DATABASE:
-        await cleanup_database()
-    
-    # Close aiohttp session
-    global _aiohttp_session
-    if _aiohttp_session and not _aiohttp_session.closed:
-        logger.info("🔌 Closing aiohttp session...")
-        await _aiohttp_session.close()
-        _aiohttp_session = None
-    
-    # Final garbage collection and memory check
-    logger.info("🧹 Final cleanup - forcing garbage collection")
+    # Clean up after processing user
     gc.collect()
-    logger.info("📊 Final memory state:")
     log_memory()
     
-    return stats['downloaded'], stats['sent'], total_urls
-
-# ───────────────────────────────
-# ✅ FIXED TOPIC CREATION FUNCTION
-# ───────────────────────────────
-async def create_forum_topic(client: Client, chat_id: int, topic_name: str):
-    """Create a forum topic and return its ID"""
-    try:
-        # Verify bot can access the chat
-        try:
-            chat = await client.get_chat(chat_id)
-            logger.info(f"📣 Connected to chat: {chat.title}")
-        except Exception:
-            logger.info("ℹ️ Chat not found in cache. Sending handshake message...")
-            await client.send_message(chat_id, "👋 Bot connected successfully!")
-            chat = await client.get_chat(chat_id)
-        
-        # Create the forum topic
-        peer = await client.resolve_peer(chat_id)
-        random_id = random.randint(100000, 999999999)
-        
-        result = await client.invoke(
-            CreateForumTopic(
-                channel=peer,
-                title=topic_name,
-                random_id=random_id,
-                icon_color=0xFFD700  # optional: gold color
-            )
-        )
-        
-        # Extract topic_id
-        topic_id = None
-        for update in result.updates:
-            if hasattr(update, "message") and hasattr(update.message, "id"):
-                topic_id = update.message.id
-                break
-        
-        if not topic_id:
-            logger.error("⚠️ Could not detect topic_id. Check permissions.")
-            return None
-        
-        logger.info(f"🆕 Topic created: {topic_name} (ID: {topic_id})")
-        return topic_id
-        
-    except Exception as e:
-        logger.error(f"❌ Error creating topic '{topic_name}': {str(e)}")
-        return None
-
-# ───────────────────────────────
-# 🔍 HELPER: GET CHAT ID
-# ───────────────────────────────
-@bot.on_message(filters.command("getid"))
-async def get_chat_id(client: Client, message: Message):
-    """Get the chat ID of current chat or forwarded message"""
-    if message.forward_from_chat:
-        chat = message.forward_from_chat
-        await message.reply(
-            f"**Forwarded Chat Info:**\n"
-            f"• Title: {chat.title}\n"
-            f"• ID: `{chat.id}`\n"
-            f"• Type: {chat.type}\n"
-            f"• Is Forum: {getattr(chat, 'is_forum', False)}"
-        )
-    else:
-        chat = message.chat
-        await message.reply(
-            f"**Current Chat Info:**\n"
-            f"• Title: {getattr(chat, 'title', 'Private Chat')}\n"
-            f"• ID: `{chat.id}`\n"
-            f"• Type: {chat.type}\n"
-            f"• Is Forum: {getattr(chat, 'is_forum', False)}"
-        )
+    # Update progress
+    progress += 100 / total_users
+    bar = generate_bar(progress)
+    msg = f"completed {user_idx+1}/{total_users}\n{bar} {progress:.2f}%\nprocess current username: {user} - completed"
+    now = time.time()
+    if now - last_edit[0] > 3 and msg != last_edit[1]:
+        await progress_msg.edit(msg)
+        last_edit[0] = now
+        last_edit[1] = msg
 
 # ───────────────────────────────
 # BOT HANDLER
 # ───────────────────────────────
-@bot.on_message(filters.command("down") & filters.private)
-async def handle_down(client: Client, message: Message):
-    """
-    Main bot handler for /down command
+@bot.on_message(filters.text & filters.private)
+async def handle_message(client: Client, message: Message):
+    if message.chat.id not in ALLOWED_CHAT_IDS:
+        return
+
+    text = message.text.strip()
+    match = re.match(r"(.+?)\s+(\d)$", text)
+    if not match:
+        await message.reply("Invalid format. Use: usernames separated by comma, then 0 or 1 for title_only")
+        return
     
-    Usage:
-        /down <url> [-g <chat_id>] [-t <topic_id>] [-ct <topic_name>] [-u]
+    usernames_part = match.group(1)
+    title_only = int(match.group(2))
+    usernames = [u.strip() for u in usernames_part.split(',') if u.strip()]
+    if not usernames:
+        await message.reply("No usernames provided")
+        return
+    
+    total_users = len(usernames)
+    last_edit = [0, ""]
+    
+    # Send initial progress message
+    progress_msg = await message.reply("Starting processing...")
+    
+    for user_idx, user in enumerate(usernames):
+        retry_count = 0
+        while retry_count < 3:  # Max 3 attempts (initial + 2 retries)
+            await process_user(user, title_only, user_idx, total_users, progress_msg, last_edit)
+            
+            # Check media count for this user
+            async with aiosqlite.connect(TEMP_DB) as db:
+                cursor = await db.execute('SELECT COUNT(*) FROM media WHERE username = ?', (user,))
+                count = (await cursor.fetchone())[0]
+            
+            if count > 0:
+                break
+            
+            retry_count += 1
+            if retry_count < 3:
+                logger.info(f"Retrying user {user}, attempt {retry_count + 1}")
+                # Optional: Update progress message for retry
+                progress = (user_idx / total_users) * 100
+                bar = generate_bar(progress)
+                msg = f"completed {user_idx}/{total_users}\n{bar} {progress:.2f}%\nRetrying {user} (attempt {retry_count + 1})"
+                now = time.time()
+                if now - last_edit[0] > 3 and msg != last_edit[1]:
+                    await progress_msg.edit(msg)
+                    last_edit[0] = now
+                    last_edit[1] = msg
+    
+    # Final progress
+    progress = 100
+    bar = generate_bar(progress)
+    msg = f"completed {total_users}/{total_users}\n{bar} {progress:.2f}%\nQuerying database and preparing HTML..."
+    if msg != last_edit[1]:
+        await progress_msg.edit(msg)
+        last_edit[0] = time.time()
+        last_edit[1] = msg
+    
+    # Query media from DB in batches to avoid memory overflow
+    logger.info("Querying media from database")
+    log_memory()
+    
+    # Build media_by_date_per_username by processing in batches
+    media_by_date_per_username = defaultdict(lambda: {"images": {}, "videos": {}, "gifs": {}})
+    async with aiosqlite.connect(TEMP_DB) as db:
+        # Get total count first
+        cursor = await db.execute('SELECT COUNT(*) FROM media')
+        total_count = (await cursor.fetchone())[0]
+        logger.info(f"Total media items in database: {total_count}")
         
-    Options:
-        -g: Target group/channel chat ID
-        -t: Existing topic ID to reply to
-        -ct: Create new topic with this name
-        -u: Create separate topics per user
-    """
+        # Process in batches of 10000
+        batch_size = 10000
+        offset = 0
+        while offset < total_count:
+            cursor = await db.execute('SELECT username, post_date, media_url, media_type FROM media LIMIT ? OFFSET ?', (batch_size, offset))
+            rows = await cursor.fetchall()
+            
+            for row in rows:
+                user, date, url, typ = row
+                # Clean and validate URL
+                url = url.strip()
+                # Remove URL encoding artifacts
+                if url.startswith('%22') and url.endswith('%22'):
+                    url = url[3:-3]
+                if url.startswith('"') and url.endswith('"'):
+                    url = url[1:-1]
+                
+                # Skip invalid URLs
+                if not url.startswith(('http://', 'https://')):
+                    continue
+                
+                if date not in media_by_date_per_username[user][typ]:
+                    media_by_date_per_username[user][typ][date] = []
+                media_by_date_per_username[user][typ][date].append(url)
+            
+            offset += batch_size
+            logger.info(f"Processed {min(offset, total_count)}/{total_count} media items")
+            
+            # Clean up batch
+            del rows
+            gc.collect()
+    
+    log_memory()
+    
+    # Update progress before HTML generation
+    msg = f"completed {total_users}/{total_users}\n{bar} {progress:.2f}%\nGenerating HTML file..."
+    now = time.time()
+    if now - last_edit[0] > 3 and msg != last_edit[1]:
+        await progress_msg.edit(msg)
+        last_edit[0] = now
+        last_edit[1] = msg
+    
+    # Generate HTML
     try:
-        text = message.text.strip()
-        args = text.split()[1:] if len(text.split()) > 1 else []
-
-        # Parse arguments
-        url = None
-        target_chat_id = message.chat.id
-        target_topic_id = None
-        create_topic_name = None
-        create_topics_per_user = False
-
-        i = 0
-        while i < len(args):
-            if args[i] == '-g' and i + 1 < len(args):
-                try:
-                    target_chat_id = int(args[i + 1])
-                except ValueError:
-                    await message.reply(f"❌ Invalid chat ID: {args[i + 1]}")
-                    return
-                i += 2
-            elif args[i] == '-t' and i + 1 < len(args):
-                try:
-                    target_topic_id = int(args[i + 1])
-                except ValueError:
-                    await message.reply(f"❌ Invalid topic ID: {args[i + 1]}")
-                    return
-                i += 2
-            elif args[i] == '-ct' and i + 1 < len(args):
-                create_topic_name = args[i + 1]
-                i += 2
-            elif args[i] == '-u':
-                create_topics_per_user = True
-                i += 1
-            else:
-                if not url:
-                    url = args[i]
-                i += 1
-
-        # Get HTML content
-        html_content = ""
-        if message.reply_to_message:
-            if message.reply_to_message.document:
-                # Download document
-                try:
-                    file_path = await message.reply_to_message.download()
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        html_content = f.read()
-                    os.remove(file_path)
-                    logger.info("✅ HTML document downloaded and parsed")
-                except Exception as e:
-                    await message.reply(f"❌ Error reading document: {str(e)}")
-                    return
-            elif message.reply_to_message.text:
-                # Assume URLs in text
-                urls = re.findall(r'https?://[^\s]+', message.reply_to_message.text)
-                if urls:
-                    # Fetch first URL as HTML
-                    html_content = await fetch_html(urls[0])
-                    if not html_content:
-                        await message.reply(f"❌ Failed to fetch HTML from: {urls[0]}")
-                        return
-        elif url:
-            html_content = await fetch_html(url)
-            if not html_content:
-                await message.reply(f"❌ Failed to fetch HTML from: {url}")
-                return
-
-        if not html_content:
-            await message.reply("❌ No valid HTML content found. Please provide a URL or reply to an HTML document.")
-            return
-
-        # Extract data
-        media_data, usernames, year_counts = extract_media_data_from_html(html_content)
-        if not media_data:
-            await message.reply("❌ Failed to extract media data from HTML. Check if the HTML contains 'const mediaData = {...}'")
-            return
-
-        username_images = create_username_images(media_data, usernames)
-        username_images, all_urls = filter_and_deduplicate_urls(username_images)
-
-        total_media = sum(len(urls) for urls in username_images.values())
-        total_images = len(all_urls)
-
-        if total_images == 0:
-            await message.reply("❌ No valid images/media found after filtering.")
-            return
-
-        logger.info(f"📊 Found {total_images} media items for {len(username_images)} users")
-
-        # Handle topic creation with improved logic
-        user_topic_ids = {}
-        if create_topics_per_user:
-            logger.info(f"🆕 Creating {len(username_images)} topics for users...")
-            topics_created = 0
-            for username in username_images.keys():
-                topic_name = f"{username.replace('_', ' ')}"
-                topic_id = await create_forum_topic(client, target_chat_id, topic_name)
-                if topic_id:
-                    user_topic_ids[username] = topic_id
-                    topics_created += 1
-                await asyncio.sleep(0.5)  # Small delay between topic creations
-            logger.info(f"✅ Created {topics_created}/{len(username_images)} topics")
-        elif create_topic_name:
-            logger.info(f"🆕 Creating single topic: {create_topic_name}")
-            target_topic_id = await create_forum_topic(client, target_chat_id, create_topic_name)
-            if not target_topic_id:
-                await message.reply(f"❌ Failed to create topic '{create_topic_name}'. Check bot permissions.")
-                return
-
-        # Send initial progress
-        progress_msg = await message.reply("🚀 Starting download process...")
-
-        # Process batches
-        total_downloaded, total_sent, total_filtered = await process_batches(
-            username_images, target_chat_id, target_topic_id, user_topic_ids, progress_msg
-        )
-
-        # Final stats
-        failed_count = total_filtered - total_downloaded
-        success_rate = int((total_downloaded / total_filtered * 100)) if total_filtered > 0 else 0
-        
-        stats = f"""✅ **Download Complete!**
-
-📊 **Final Statistics:**
-━━━━━━━━━━━━━━━━━━━━
-• 📁 Total Media Found: {total_media}
-• 🔍 Filtered & Valid: {total_filtered}
-• ✅ Successfully Downloaded: {total_downloaded}
-• 📤 Successfully Sent: {total_sent}
-• ❌ Failed: {failed_count}
-• 📈 Success Rate: {success_rate}%
-━━━━━━━━━━━━━━━━━━━━
-• 👥 Users Processed: {len(username_images)}
-• 🗂️ Topics Created: {len(user_topic_ids) if user_topic_ids else (1 if target_topic_id else 0)}"""
-
-        try:
-            await progress_msg.edit(stats)
-        except Exception as e:
-            logger.error(f"❌ Failed to update final stats: {str(e)}")
+        html_content = create_html(media_by_date_per_username, usernames, 2019, 2025)
+    except Exception as html_error:
+        logger.error(f"HTML generation error: {str(html_error)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        html_content = None
     
-    except Exception as e:
-        logger.error(f"❌ Critical error in handle_down: {str(e)}", exc_info=True)
+    total_items = sum(len(media_list) for user_media in media_by_date_per_username.values() for media_type in user_media.values() for media_list in media_type.values())
+    
+    # Clean up media_by_date_per_username to free memory
+    del media_by_date_per_username
+    gc.collect()
+    log_memory()
+    
+    if html_content:
         try:
-            await message.reply(f"❌ An error occurred: {str(e)}")
-        except:
-            pass
+            # Save HTML file
+            with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                f.write(html_content)
+            logger.info(f"HTML file saved: {OUTPUT_FILE}")
+            
+            # Clean up html_content from memory
+            del html_content
+            gc.collect()
+            log_memory()
+            
+            # Upload
+            with open(OUTPUT_FILE, "rb") as f:
+                data = f.read()
+            
+            logger.info(f"Starting upload, file size: {len(data) / (1024*1024):.2f} MB")
+            async with httpx.AsyncClient() as client:
+                tasks = [upload_file(client, h, data) for h in HOSTS]
+                results = await asyncio.gather(*tasks)
+            
+            links = []
+            for name, res in results:
+                status = "✅" if res.startswith("https://") else "❌"
+                links.append(f"{status} {name}: {res}")
+            
+            caption = f"Total Media in Html: {total_items}\n───────────────────────────────────\n📤 Uploading Final HTML to Hosting Services\n" + "\n".join(links)
+            
+            logger.info("Sending document to user")
+            await message.reply_document(OUTPUT_FILE, caption=caption)
+            logger.info("Document sent successfully")
+            
+            # Delete progress message after sending the final gallery
+            await progress_msg.delete()
+            
+            # Clean up
+            try:
+                if os.path.exists(TEMP_DB):
+                    await asyncio.to_thread(os.remove, TEMP_DB)
+                if os.path.exists("Scraping"):
+                    import shutil
+                    await asyncio.to_thread(shutil.rmtree, "Scraping")
+                logger.info("Cleanup completed")
+            except Exception as e:
+                logger.error(f"Cleanup error: {e}")
+        except Exception as send_error:
+            logger.error(f"Error sending output: {str(send_error)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            await message.reply(f"Error sending output: {str(send_error)}\nCheck logs for details.")
+    else:
+        error_msg = "Failed to generate HTML. Check logs for details."
+        logger.error(error_msg)
+        await message.reply(error_msg)
 
 # ───────────────────────────────
 # MAIN
 # ───────────────────────────────
-async def cleanup_on_shutdown():
-    """Cleanup aiohttp session on shutdown"""
-    global _aiohttp_session
-    if _aiohttp_session and not _aiohttp_session.closed:
-        logger.info("🔌 Shutting down aiohttp session...")
-        await _aiohttp_session.close()
-
 if __name__ == "__main__":
     threading.Thread(target=run_fastapi, daemon=True).start()
     bot.run()
