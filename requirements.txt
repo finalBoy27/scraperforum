@@ -9,3 +9,4 @@ psutil
 TgCrypto
 Pillow
 imageio
+aiohttp
